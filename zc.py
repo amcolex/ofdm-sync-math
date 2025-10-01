@@ -12,8 +12,15 @@ from core import (
     spectrum_to_time_domain,
     add_cyclic_prefix,
     plot_time_series,
-    build_random_bpsk_symbol,
+    build_random_qpsk_symbol,
     compute_channel_peak_offset,
+    estimate_cfo_from_cp,
+    ofdm_fft_used,
+    ls_channel_estimate,
+    equalize,
+    remove_common_phase,
+    evm_rms_db,
+    plot_constellation,
     SAMPLE_RATE_HZ,
     apply_cfo,
 )
@@ -39,7 +46,7 @@ def build_pss_symbol(include_cp: bool = True) -> np.ndarray:
 
 
 # Script-local parameters
-SNR_DB = 10.0
+SNR_DB = 35.0
 CFO_HZ = 1000.0
 
 PLOTS_DIR = Path("plots") / "zc"
@@ -48,8 +55,9 @@ TX_PLOT_PATH = PLOTS_DIR / "tx_frame_time.png"
 RX_PLOT_PATH = PLOTS_DIR / "rx_frame_time.png"
 RESULTS_PLOT_PATH = PLOTS_DIR / "start_detection.png"
 CIR_PLOT_PATH = PLOTS_DIR / "channel_cir.png"
+CONST_PLOT_PATH = PLOTS_DIR / "constellation.png"
 
-CHANNEL_PROFILE = "cir1"  # Set to None to bypass measured CIR
+CHANNEL_PROFILE = None # Set to None to bypass measured CIR
 CHANNEL_RX_INDICES: tuple[int, ...] | None = (0, 1)
 
 
@@ -58,8 +66,9 @@ def run_simulation():
     PLOTS_DIR.mkdir(parents=True, exist_ok=True)
 
     pss_waveform = build_pss_symbol(include_cp=True)
-    data_symbol = build_random_bpsk_symbol(rng, include_cp=True)
-    frame = np.concatenate((pss_waveform, data_symbol))
+    pilot_symbol, pilot_used = build_random_qpsk_symbol(rng, include_cp=True)
+    data_symbol, data_used = build_random_qpsk_symbol(rng, include_cp=True)
+    frame = np.concatenate((pss_waveform, pilot_symbol, data_symbol))
     tx_samples = np.concatenate((np.zeros(TX_PRE_PAD_SAMPLES, dtype=complex), frame))
 
     channel_impulse_response = None
@@ -163,6 +172,35 @@ def run_simulation():
     plot_time_series(tx_samples, "Transmit Frame (with Leading Zeros)", TX_PLOT_PATH)
     plot_time_series(rx_samples, "Received Frame After Channel", RX_PLOT_PATH)
 
+    # --- CFO estimation from pilot (CP correlation) ---
+    # detected_start aligns to start of the N-length part of the preamble
+    pilot_cp_nom = detected_start + N_FFT
+    from core import find_cp_start_via_corr
+    pilot_cp_start = find_cp_start_via_corr(
+        rx_samples, pilot_cp_nom, N_FFT, CYCLIC_PREFIX, search_half=2 * CYCLIC_PREFIX
+    )
+    data_cp_start = pilot_cp_start + pilot_symbol.size
+    cfo_est_hz = estimate_cfo_from_cp(rx_samples, pilot_cp_start, N_FFT, CYCLIC_PREFIX, SAMPLE_RATE_HZ)
+    # Compensate CFO across entire stream
+    rx_cfo_corr = apply_cfo(rx_samples, -cfo_est_hz, SAMPLE_RATE_HZ)
+
+    # --- Channel LS estimate from pilot ---
+    # Combine branches by simple average after CFO correction
+    rx_eff = rx_cfo_corr if rx_cfo_corr.ndim == 1 else np.mean(rx_cfo_corr, axis=0)
+    pilot_td = rx_eff[pilot_cp_start + CYCLIC_PREFIX : pilot_cp_start + CYCLIC_PREFIX + N_FFT]
+    y_pilot_used = ofdm_fft_used(pilot_td)
+    h_est = ls_channel_estimate(y_pilot_used, pilot_used)
+
+    # --- Equalize data symbol and compute EVM ---
+    data_td = rx_eff[data_cp_start + CYCLIC_PREFIX : data_cp_start + CYCLIC_PREFIX + N_FFT]
+    y_data_used = ofdm_fft_used(data_td)
+    xhat = equalize(y_data_used, h_est)
+    # Align residual common phase and amplitude via complex LS gain
+    from core import align_complex_gain
+    xhat_aligned, gain = align_complex_gain(xhat, data_used)
+    evm_rms, evm_db = evm_rms_db(xhat_aligned, data_used)
+    plot_constellation(xhat_aligned, data_used, CONST_PLOT_PATH, "Equalized Data Constellation (ZC)")
+
     print(f"Frame length (without pad): {frame.size} samples")
     print(f"Transmit sequence length: {tx_samples.size} samples")
     print(f"Receive branches: {num_branches}")
@@ -186,6 +224,9 @@ def run_simulation():
     if channel_impulse_response is not None:
         print(f"Saved channel CIR plot to {CIR_PLOT_PATH.resolve()}")
     print(f"Applied CFO: {CFO_HZ} Hz at Fs={SAMPLE_RATE_HZ} Hz")
+    print(f"Estimated CFO from CP: {cfo_est_hz:.2f} Hz")
+    print(f"Post-EQ complex gain (mag, angle): {np.abs(gain):.3f}, {np.angle(gain):.3f} rad")
+    print(f"EVM RMS: {100*evm_rms:.2f}%  ({evm_db:.2f} dB)")
 
 
 def main():

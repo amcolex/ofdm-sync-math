@@ -137,3 +137,144 @@ def apply_cfo(samples: np.ndarray, cfo_hz: float, fs_hz: float) -> np.ndarray:
     n = np.arange(L, dtype=float)
     tone = np.exp(1j * 2 * np.pi * cfo_hz * n / fs_hz)
     return x * tone[np.newaxis, :]
+
+
+# -----------------------------
+# Extra OFDM helpers for pilots
+# -----------------------------
+
+def _qpsk_values(rng: np.random.Generator, size: int) -> np.ndarray:
+    m = rng.integers(0, 4, size=size)
+    re = (m & 1) * 2 - 1  # 0->-1, 1->+1 for LSB
+    im = ((m >> 1) & 1) * 2 - 1
+    vals = (re + 1j * im) / np.sqrt(2.0)
+    return vals.astype(np.complex128)
+
+
+def build_random_qpsk_symbol(
+    rng: np.random.Generator, include_cp: bool = True
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return (time_domain_symbol, used_subcarrier_values) for a full-band QPSK OFDM symbol.
+
+    - Active subcarriers are the centered set of width NUM_ACTIVE_SUBCARRIERS (DC skipped).
+    - QPSK constellation with unit average power on used tones.
+    - Time-domain symbol is unit-power normalized.
+    """
+    indices = centered_subcarrier_indices(NUM_ACTIVE_SUBCARRIERS)
+    qpsk_vals = _qpsk_values(rng, indices.shape[0])
+    spectrum = allocate_subcarriers(N_FFT, indices, qpsk_vals)
+    symbol = spectrum_to_time_domain(spectrum)
+    if include_cp:
+        symbol = add_cyclic_prefix(symbol, CYCLIC_PREFIX)
+    return symbol, qpsk_vals
+
+
+def ofdm_fft_used(symbol_time_no_cp: np.ndarray) -> np.ndarray:
+    """FFT an OFDM symbol (no CP) and return only used, centered subcarriers."""
+    spectrum_full = np.fft.fftshift(np.fft.fft(symbol_time_no_cp, n=N_FFT))
+    dc = N_FFT // 2
+    idx = centered_subcarrier_indices(NUM_ACTIVE_SUBCARRIERS)
+    return spectrum_full[(dc + idx) % N_FFT]
+
+
+def estimate_cfo_from_cp(
+    rx: np.ndarray, start: int, n_fft: int, cp_len: int, fs_hz: float
+) -> float:
+    """Estimate CFO (Hz) from CP correlation on a symbol whose CP starts at `start`.
+
+    Uses P = sum r[start+n] r*[start+n+N] over CP length.
+    Supports 1D (single branch) or 2D (branches x time) arrays by summing across branches.
+    """
+    x = np.asarray(rx)
+    if x.ndim == 1:
+        x = x[np.newaxis, :]
+    a = x[:, start : start + cp_len]
+    b = x[:, start + n_fft : start + n_fft + cp_len]
+    P = np.sum(a * np.conj(b))
+    angle = np.angle(P)
+    # angle(P) ≈ -2π * f_cfo * N / Fs  => f_cfo ≈ -angle * Fs / (2π N)
+    cfo_hz = -angle * fs_hz / (2 * np.pi * n_fft)
+    return float(cfo_hz)
+
+
+def find_cp_start_via_corr(
+    rx: np.ndarray,
+    est_start: int,
+    n_fft: int,
+    cp_len: int,
+    search_half: int = 1024,
+) -> int:
+    """Refine CP start using the magnitude of CP correlation |P(d)|.
+
+    Searches over d in [est_start - search_half, est_start + search_half] and
+    returns the d that maximizes |sum r[d+n] r*[d+n+n_fft]|.
+    """
+    x = np.asarray(rx)
+    if x.ndim == 1:
+        x = x[np.newaxis, :]
+    L = x.shape[1]
+    lo = max(0, est_start - search_half)
+    hi = min(L - (n_fft + cp_len), est_start + search_half)
+    if hi <= lo:
+        return est_start
+    best_d = lo
+    best_val = -1.0
+    for d in range(lo, hi):
+        a = x[:, d : d + cp_len]
+        b = x[:, d + n_fft : d + n_fft + cp_len]
+        P = np.sum(a * np.conj(b))
+        val = float(np.abs(P))
+        if val > best_val:
+            best_val = val
+            best_d = d
+    return best_d
+
+
+def ls_channel_estimate(y_used: np.ndarray, x_used: np.ndarray, eps: float = 1e-9) -> np.ndarray:
+    """Least-squares per-subcarrier channel estimate H = Y/X with small regularization."""
+    return y_used / (x_used + eps)
+
+
+def equalize(y_used: np.ndarray, h_est: np.ndarray, eps: float = 1e-9) -> np.ndarray:
+    return y_used / (h_est + eps)
+
+
+def remove_common_phase(x: np.ndarray, ref: np.ndarray | None = None) -> tuple[np.ndarray, float]:
+    """De-rotate by common phase error. If `ref` given, align x to ref; else use mean angle of x."""
+    if ref is None:
+        cpe = np.angle(np.mean(x))
+    else:
+        cpe = np.angle(np.vdot(ref, x) / (np.vdot(ref, ref) + 1e-12))
+    return x * np.exp(-1j * cpe), float(cpe)
+
+
+def align_complex_gain(x: np.ndarray, ref: np.ndarray, eps: float = 1e-12) -> tuple[np.ndarray, complex]:
+    """Scale x by complex gain g to best fit ref in LS sense: minimize ||g x - ref||^2."""
+    num = np.vdot(x, ref)
+    den = np.vdot(x, x) + eps
+    g = num / den
+    return x * g, g
+
+
+def evm_rms_db(x: np.ndarray, ref: np.ndarray) -> tuple[float, float]:
+    """Return (evm_rms, evm_db) where EVM is normalized to reference RMS magnitude."""
+    err = x - ref
+    evm_rms = np.sqrt(np.mean(np.abs(err) ** 2) / np.mean(np.abs(ref) ** 2))
+    evm_db = 20 * np.log10(evm_rms + 1e-12)
+    return float(evm_rms), float(evm_db)
+
+
+def plot_constellation(x: np.ndarray, ref: np.ndarray | None, path: Path, title: str) -> None:
+    fig, ax = plt.subplots(figsize=(5, 5))
+    ax.scatter(x.real, x.imag, s=6, alpha=0.6, label="Equalized")
+    if ref is not None:
+        ax.scatter(ref.real, ref.imag, s=36, alpha=0.8, marker="x", label="Ideal")
+    ax.set_xlabel("In-phase")
+    ax.set_ylabel("Quadrature")
+    ax.set_title(title)
+    ax.grid(True, alpha=0.3)
+    ax.set_aspect("equal", adjustable="box")
+    ax.legend(loc="upper right")
+    fig.tight_layout()
+    fig.savefig(path, dpi=150)
+    plt.close(fig)

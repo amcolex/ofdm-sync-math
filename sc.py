@@ -13,8 +13,15 @@ from core import (
     spectrum_to_time_domain,
     add_cyclic_prefix,
     plot_time_series,
-    build_random_bpsk_symbol,
     compute_channel_peak_offset,
+    build_random_qpsk_symbol,
+    estimate_cfo_from_cp,
+    ofdm_fft_used,
+    ls_channel_estimate,
+    equalize,
+    remove_common_phase,
+    evm_rms_db,
+    plot_constellation,
     SAMPLE_RATE_HZ,
     apply_cfo,
 )
@@ -91,7 +98,7 @@ def find_plateau_end_from_metric(M: np.ndarray, smooth_win: int, n_fft: int) -> 
 
 
 # Detector and channel parameters (script-local)
-SNR_DB = 15.0
+SNR_DB = 35.0
 CFO_HZ = 1000.0
 SC_DELTA = 12  # step back from plateau end to sit inside CP (8–16 suggested)
 SMOOTH_WIN = 32  # samples for smoothing M(d) before slope detection
@@ -103,9 +110,10 @@ TX_PLOT_PATH = PLOTS_DIR / "tx_frame_time.png"
 RX_PLOT_PATH = PLOTS_DIR / "rx_frame_time.png"
 RESULTS_PLOT_PATH = PLOTS_DIR / "start_detection.png"
 CIR_PLOT_PATH = PLOTS_DIR / "channel_cir.png"
+CONST_PLOT_PATH = PLOTS_DIR / "constellation.png"
 
 # Channel profile (set to 'cir1' or 'cir2' to enable measured CIR)
-CHANNEL_PROFILE = "cir1"
+CHANNEL_PROFILE = None
 CHANNEL_RX_INDICES: tuple[int, ...] | None = (0, 1)
 
 
@@ -113,10 +121,11 @@ def run_simulation():
     rng = np.random.default_rng(0)
     PLOTS_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Build S&C preamble + a random data symbol
+    # Build S&C preamble + block pilot (QPSK) + random QPSK data
     sc_preamble = build_sc_preamble(rng, include_cp=True)
-    data_symbol = build_random_bpsk_symbol(rng, include_cp=True)
-    frame = np.concatenate((sc_preamble, data_symbol))
+    pilot_symbol, pilot_used = build_random_qpsk_symbol(rng, include_cp=True)
+    data_symbol, data_used = build_random_qpsk_symbol(rng, include_cp=True)
+    frame = np.concatenate((sc_preamble, pilot_symbol, data_symbol))
     tx_samples = np.concatenate((np.zeros(TX_PRE_PAD_SAMPLES, dtype=complex), frame))
 
     # Optional channel
@@ -209,6 +218,34 @@ def run_simulation():
     plot_time_series(tx_samples, "Transmit Frame (with Leading Zeros)", TX_PLOT_PATH)
     plot_time_series(rx_samples, "Received Frame After Channel", RX_PLOT_PATH)
 
+    # --- CFO estimation from pilot (CP correlation) ---
+    # plateau_end approximates the end of CP and start of N for the preamble
+    preamble_n_start_est = plateau_end
+    pilot_cp_nom = preamble_n_start_est + N_FFT
+    from core import find_cp_start_via_corr
+    pilot_cp_start = find_cp_start_via_corr(
+        rx_samples, pilot_cp_nom, N_FFT, CYCLIC_PREFIX, search_half=2 * CYCLIC_PREFIX
+    )
+    data_cp_start = pilot_cp_start + pilot_symbol.size
+    cfo_est_hz = estimate_cfo_from_cp(rx_samples, pilot_cp_start, N_FFT, CYCLIC_PREFIX, SAMPLE_RATE_HZ)
+    # Compensate CFO across entire stream
+    rx_cfo_corr = apply_cfo(rx_samples, -cfo_est_hz, SAMPLE_RATE_HZ)
+
+    # --- Channel LS estimate from pilot ---
+    rx_eff = rx_cfo_corr if rx_cfo_corr.ndim == 1 else np.mean(rx_cfo_corr, axis=0)
+    pilot_td = rx_eff[pilot_cp_start + CYCLIC_PREFIX : pilot_cp_start + CYCLIC_PREFIX + N_FFT]
+    y_pilot_used = ofdm_fft_used(pilot_td)
+    h_est = ls_channel_estimate(y_pilot_used, pilot_used)
+
+    # --- Equalize data symbol and compute EVM ---
+    data_td = rx_eff[data_cp_start + CYCLIC_PREFIX : data_cp_start + CYCLIC_PREFIX + N_FFT]
+    y_data_used = ofdm_fft_used(data_td)
+    xhat = equalize(y_data_used, h_est)
+    from core import align_complex_gain
+    xhat_aligned, gain = align_complex_gain(xhat, data_used)
+    evm_rms, evm_db = evm_rms_db(xhat_aligned, data_used)
+    plot_constellation(xhat_aligned, data_used, CONST_PLOT_PATH, "Equalized Data Constellation (S&C)")
+
     # Prints
     print(f"Transmit sequence length: {tx_samples.size} samples")
     print(f"Receive branches: {1 if rx_samples.ndim == 1 else rx_samples.shape[0]}")
@@ -228,6 +265,9 @@ def run_simulation():
     if channel_impulse_response is not None:
         print(f"Saved channel CIR plot to {CIR_PLOT_PATH.resolve()}")
     print(f"Applied CFO: {CFO_HZ} Hz at Fs={SAMPLE_RATE_HZ} Hz")
+    print(f"Estimated CFO from CP: {cfo_est_hz:.2f} Hz")
+    print(f"Post-EQ complex gain (mag, angle): {np.abs(gain):.3f}, {np.angle(gain):.3f} rad")
+    print(f"EVM RMS: {100*evm_rms:.2f}%  ({evm_db:.2f} dB)")
 
 
 def main():
