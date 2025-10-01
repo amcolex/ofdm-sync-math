@@ -23,6 +23,7 @@ from core import (
     plot_constellation,
     SAMPLE_RATE_HZ,
     apply_cfo,
+    estimate_timing_offset_from_phase_slope,
 )
 
 # ZC-specific parameters
@@ -46,7 +47,7 @@ def build_pss_symbol(include_cp: bool = True) -> np.ndarray:
 
 
 # Script-local parameters
-SNR_DB = 10.0
+SNR_DB = 20.0
 CFO_HZ = 1000.0
 
 PLOTS_DIR = Path("plots") / "zc"
@@ -187,6 +188,8 @@ def run_simulation():
     pilot_td = rx_eff[pilot_cp_start + CYCLIC_PREFIX : pilot_cp_start + CYCLIC_PREFIX + N_FFT]
     y_pilot_used = ofdm_fft_used(pilot_td)
     h_est = ls_channel_estimate(y_pilot_used, pilot_used)
+    # Estimate residual timing from linear phase slope of H(k)
+    slope_rad_per_bin, timing_offset_samples = estimate_timing_offset_from_phase_slope(h_est)
 
     # --- Equalize data symbol and compute EVM ---
     data_td = rx_eff[data_cp_start + CYCLIC_PREFIX : data_cp_start + CYCLIC_PREFIX + N_FFT]
@@ -222,6 +225,9 @@ def run_simulation():
         print(f"Saved channel CIR plot to {CIR_PLOT_PATH.resolve()}")
     print(f"Applied CFO: {CFO_HZ} Hz at Fs={SAMPLE_RATE_HZ} Hz")
     print(f"Estimated CFO from CP: {cfo_est_hz:.2f} Hz")
+    print(
+        f"Pilot LS phase slope: {slope_rad_per_bin:.6f} rad/bin -> timing ≈ {timing_offset_samples:.2f} samples",
+    )
     print(f"Post-EQ complex gain (mag, angle): {np.abs(gain):.3f}, {np.angle(gain):.3f} rad")
     print(f"EVM RMS: {100*evm_rms:.2f}%  ({evm_db:.2f} dB)")
 

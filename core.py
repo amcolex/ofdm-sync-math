@@ -384,3 +384,35 @@ def plot_constellation(x: np.ndarray, ref: np.ndarray | None, path: Path, title:
     fig.tight_layout()
     fig.savefig(path, dpi=150)
     plt.close(fig)
+
+
+# -----------------------------------------------------
+# Timing offset from phase slope across subcarriers
+# -----------------------------------------------------
+def estimate_timing_offset_from_phase_slope(
+    h_used: np.ndarray,
+) -> tuple[float, float]:
+    """Estimate residual timing from linear phase slope of LS channel.
+
+    A time shift by Δ samples yields a linear phase across subcarriers:
+    angle ~ -2π k Δ / N_FFT. We fit a line to unwrapped phase vs. used
+    centered subcarrier index k (excluding DC). Returns:
+      - slope_rad_per_bin: fitted slope in radians per subcarrier index
+      - timing_offset_samples: Δ ≈ -slope * N_FFT / (2π)
+
+    Assumes `h_used` corresponds to subcarriers returned by
+    `centered_subcarrier_indices(NUM_ACTIVE_SUBCARRIERS)` in the same order
+    as `ofdm_fft_used`.
+    """
+    if h_used.size == 0:
+        return 0.0, 0.0
+    k = centered_subcarrier_indices(NUM_ACTIVE_SUBCARRIERS).astype(np.float64)
+    phi = np.unwrap(np.angle(h_used.astype(np.complex128)))
+    k_mean = float(np.mean(k))
+    phi_mean = float(np.mean(phi))
+    k_zero = k - k_mean
+    phi_zero = phi - phi_mean
+    denom = float(np.sum(k_zero * k_zero)) + 1e-12
+    slope = float(np.sum(k_zero * phi_zero) / denom)  # rad per subcarrier
+    delta_samples = -slope * N_FFT / (2.0 * np.pi)
+    return slope, float(delta_samples)
