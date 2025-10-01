@@ -149,7 +149,7 @@ def find_plateau_end_from_metric(
 # Detector and channel parameters (script-local)
 SNR_DB = 10.0
 CFO_HZ = 1000.0
-SC_DELTA = 8  # step back from plateau end to sit inside CP (8–16 suggested)
+SC_DELTA = 16  # step back from plateau end to sit inside CP (8–16 suggested)
 SMOOTH_WIN = 16  # samples for smoothing M(d) before slope detection
 
 # Output paths
