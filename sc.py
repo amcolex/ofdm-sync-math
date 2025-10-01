@@ -149,8 +149,8 @@ def find_plateau_end_from_metric(
 # Detector and channel parameters (script-local)
 SNR_DB = 10.0
 CFO_HZ = 1000.0
-SC_DELTA = 0  # step back from plateau end to sit inside CP (8–16 suggested)
-SMOOTH_WIN = 32  # samples for smoothing M(d) before slope detection
+SC_DELTA = 8  # step back from plateau end to sit inside CP (8–16 suggested)
+SMOOTH_WIN = 16  # samples for smoothing M(d) before slope detection
 
 # Output paths
 PLOTS_DIR = Path("plots") / "sc"
@@ -162,7 +162,7 @@ CIR_PLOT_PATH = PLOTS_DIR / "channel_cir.png"
 CONST_PLOT_PATH = PLOTS_DIR / "constellation.png"
 
 # Measured channel: fixed to 'cir1' ch1 (SISO). Set to None for AWGN-only.
-MEASURED_CHANNEL_NAME = None
+MEASURED_CHANNEL_NAME = "cir1"
 
 
 def run_simulation():
@@ -212,15 +212,16 @@ def run_simulation():
             CIR_PLOT_PATH,
         )
 
-    # The S&C plateau ideally spans the CP; its "end" aligns near CP end
+    # The S&C plateau "left" edge aligns at CP end (useful start).
+    # Show this as the expected left edge for clarity.
     true_cp_start = TX_PRE_PAD_SAMPLES + channel_peak_offset
-    expected_plateau_end = true_cp_start + CYCLIC_PREFIX
+    expected_left_edge = true_cp_start + CYCLIC_PREFIX
 
     # Plots
     plt.figure(figsize=(10, 4))
     plt.plot(M, label="S&C M(d)")
     plt.axvline(plateau_end, color="tab:red", linestyle=":", label="Plateau end")
-    plt.axvline(expected_plateau_end, color="tab:green", linestyle="--", label="Expected end")
+    plt.axvline(expected_left_edge, color="tab:green", linestyle="--", label="Plateau start (exp)")
     plt.xlabel("Sample index d")
     plt.ylabel("M(d)")
     plt.title("Schmidl & Cox Streaming Metric")
@@ -237,7 +238,7 @@ def run_simulation():
         for idx, branch in enumerate(rx_samples):
             axes[0].plot(np.abs(branch), alpha=0.3, linewidth=0.8)
     axes[0].axvline(true_cp_start, color="tab:purple", linestyle="--", label="CP start (true)")
-    axes[0].axvline(expected_plateau_end, color="tab:green", linestyle="--", label="Plateau end (exp)")
+    axes[0].axvline(expected_left_edge, color="tab:green", linestyle="--", label="Plateau start (exp)")
     axes[0].axvline(plateau_end, color="tab:red", linestyle=":", label="Plateau end (det)")
     axes[0].axvline(coarse_start, color="tab:orange", linestyle=":", label=f"Coarse start = end-{SC_DELTA}")
     axes[0].set_ylabel("Magnitude")
@@ -246,7 +247,7 @@ def run_simulation():
 
     axes[1].plot(M, label="S&C M(d)")
     axes[1].axvline(plateau_end, color="tab:red", linestyle=":", label="Plateau end (det)")
-    axes[1].axvline(expected_plateau_end, color="tab:green", linestyle="--", label="Plateau end (exp)")
+    axes[1].axvline(expected_left_edge, color="tab:green", linestyle="--", label="Plateau start (exp)")
     axes[1].set_xlabel("Sample index d")
     axes[1].set_ylabel("M(d)")
     axes[1].set_title("Plateau-Based Timing (End minus delta)")
@@ -304,7 +305,7 @@ def run_simulation():
         print("Channel profile disabled (AWGN only)")
     print(f"Detected plateau end at d={plateau_end}")
     print(f"Coarse start (end - {SC_DELTA}) at d={coarse_start}")
-    print(f"Expected plateau end at d={expected_plateau_end}")
+    print(f"Expected plateau start at d={expected_left_edge}")
     print(f"Saved S&C metric plot to {METRIC_PLOT_PATH.resolve()}")
     print(f"Saved transmit time series plot to {TX_PLOT_PATH.resolve()}")
     print(f"Saved receive time series plot to {RX_PLOT_PATH.resolve()}")

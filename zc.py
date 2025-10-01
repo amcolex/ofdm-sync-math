@@ -59,7 +59,7 @@ CIR_PLOT_PATH = PLOTS_DIR / "channel_cir.png"
 CONST_PLOT_PATH = PLOTS_DIR / "constellation.png"
 
 # Measured channel fixed to 'cir1' ch1 (SISO). Set to None for AWGN-only.
-MEASURED_CHANNEL_NAME = None
+MEASURED_CHANNEL_NAME = "cir1"
 
 
 def run_simulation():
