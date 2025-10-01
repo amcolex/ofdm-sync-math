@@ -147,7 +147,7 @@ def find_plateau_end_from_metric(
 
 
 # Detector and channel parameters (script-local)
-SNR_DB = 20.0
+SNR_DB = 10.0
 CFO_HZ = 1000.0
 SC_DELTA = 0  # step back from plateau end to sit inside CP (8–16 suggested)
 SMOOTH_WIN = 32  # samples for smoothing M(d) before slope detection
@@ -161,9 +161,8 @@ RESULTS_PLOT_PATH = PLOTS_DIR / "start_detection.png"
 CIR_PLOT_PATH = PLOTS_DIR / "channel_cir.png"
 CONST_PLOT_PATH = PLOTS_DIR / "constellation.png"
 
-# Channel profile (set to 'cir1' or 'cir2' to enable measured CIR)
-CHANNEL_PROFILE = "cir1"
-CHANNEL_RX_INDICES: tuple[int, ...] | None = (0, 1)
+# Measured channel: fixed to 'cir1' ch1 (SISO). Set to None for AWGN-only.
+MEASURED_CHANNEL_NAME = None
 
 
 def run_simulation():
@@ -177,23 +176,12 @@ def run_simulation():
     frame = np.concatenate((sc_preamble, pilot_symbol, data_symbol))
     tx_samples = np.concatenate((np.zeros(TX_PRE_PAD_SAMPLES, dtype=complex), frame))
 
-    # Optional channel
-    channel_impulse_response = None
-    used_rx_indices: tuple[int, ...] = (0,)
-    if CHANNEL_PROFILE:
-        cir_bank = load_measured_cir(CHANNEL_PROFILE)
-        available_channels = cir_bank.shape[0]
-        if CHANNEL_RX_INDICES is None or len(CHANNEL_RX_INDICES) == 0:
-            selected_indices = tuple(range(available_channels))
-        else:
-            selected_indices = tuple(CHANNEL_RX_INDICES)
-        invalid = [idx for idx in selected_indices if idx < 0 or idx >= available_channels]
-        if invalid:
-            raise ValueError(
-                f"Channel indices {invalid} out of range for profile '{CHANNEL_PROFILE}' (0..{available_channels - 1})",
-            )
-        used_rx_indices = selected_indices
-        channel_impulse_response = cir_bank[np.array(selected_indices)]
+    # Channel: use only ch1 (index 1) for SISO when a profile is set
+    if MEASURED_CHANNEL_NAME is None:
+        channel_impulse_response = None
+    else:
+        cir_bank = load_measured_cir(MEASURED_CHANNEL_NAME)
+        channel_impulse_response = cir_bank[1:2]  # shape (1, taps)
 
     rx_samples = apply_channel(
         tx_samples,
@@ -216,11 +204,11 @@ def run_simulation():
 
     # Ground-truth alignment helpers
     channel_peak_offset = compute_channel_peak_offset(channel_impulse_response)
+    # Plot raw CIR if measured profile enabled
     if channel_impulse_response is not None:
-        # Plot raw CIR per branch
         plot_time_series(
             channel_impulse_response,
-            f"Measured Channel CIR ('{CHANNEL_PROFILE}', branches {used_rx_indices})",
+            f"Measured Channel CIR ('{MEASURED_CHANNEL_NAME}', ch1)",
             CIR_PLOT_PATH,
         )
 
@@ -310,7 +298,7 @@ def run_simulation():
     print(f"Receive branches: {1 if rx_samples.ndim == 1 else rx_samples.shape[0]}")
     if channel_impulse_response is not None:
         print(
-            f"Applied channel '{CHANNEL_PROFILE}' (branches {used_rx_indices}) taps={channel_impulse_response.shape[1]} main-path offset={channel_peak_offset}",
+            f"Applied measured channel '{MEASURED_CHANNEL_NAME}' (ch1 only) taps={channel_impulse_response.shape[1]} main-path offset={channel_peak_offset}",
         )
     else:
         print("Channel profile disabled (AWGN only)")
