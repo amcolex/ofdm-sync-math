@@ -6,7 +6,6 @@ from pathlib import Path
 N_FFT = 2048
 NUM_ACTIVE_SUBCARRIERS = 1200
 CYCLIC_PREFIX = 512
-SNR_DB = 35.0
 TX_PRE_PAD_SAMPLES = 1337
 SAMPLE_RATE_HZ = 30_720_000.0  # default 30.72 MHz (adjust as needed)
 
@@ -195,6 +194,113 @@ def estimate_cfo_from_cp(
     # angle(P) ≈ -2π * f_cfo * N / Fs  => f_cfo ≈ -angle * Fs / (2π N)
     cfo_hz = -angle * fs_hz / (2 * np.pi * n_fft)
     return float(cfo_hz)
+
+
+def estimate_cfo_from_cp_robust(
+    rx: np.ndarray,
+    cp_start_est: int,
+    n_fft: int,
+    cp_len: int,
+    fs_hz: float,
+    span: int | None = None,
+    win_len: int | None = None,
+) -> float:
+    """Robust CFO estimate by aggregating CP correlations around an estimated start.
+
+    - Sums P(d) over d in [cp_start_est - span, cp_start_est + span] using a
+      shorter window length `win_len` to tolerate misalignment.
+    - Returns CFO in Hz with the same sign convention as `estimate_cfo_from_cp`.
+    """
+    x = np.asarray(rx)
+    if x.ndim == 1:
+        x = x[np.newaxis, :]
+    L = x.shape[1]
+    span = cp_len // 2 if span is None else int(max(0, span))
+    win = cp_len // 2 if win_len is None else int(max(1, win_len))
+    d_lo = max(0, cp_start_est - span)
+    d_hi = min(L - (n_fft + win), cp_start_est + span)
+    if d_hi <= d_lo:
+        return estimate_cfo_from_cp(x, cp_start_est, n_fft, min(cp_len, win), fs_hz)
+    P_acc = 0.0 + 0.0j
+    for d in range(d_lo, d_hi):
+        a = x[:, d : d + win]
+        b = x[:, d + n_fft : d + n_fft + win]
+        P_acc += np.sum(a * np.conj(b))
+    angle = np.angle(P_acc)
+    cfo_hz = -angle * fs_hz / (2 * np.pi * n_fft)
+    return float(cfo_hz)
+
+
+def estimate_cfo_from_cp_peak(
+    rx: np.ndarray,
+    cp_start_est: int,
+    n_fft: int,
+    cp_len: int,
+    fs_hz: float,
+    span: int | None = None,
+) -> float:
+    """Pick the CP offset with maximum |P(d)| near the estimated CP start and use its phase.
+
+    This does not change frame timing — it only chooses the best CP correlation
+    offset for CFO estimation within a small local window.
+    """
+    x = np.asarray(rx)
+    if x.ndim == 1:
+        x = x[np.newaxis, :]
+    L = x.shape[1]
+    span = cp_len // 2 if span is None else int(max(0, span))
+    d_lo = max(0, cp_start_est - span)
+    d_hi = min(L - (n_fft + cp_len), cp_start_est + span)
+    if d_hi <= d_lo:
+        return estimate_cfo_from_cp(x, cp_start_est, n_fft, cp_len, fs_hz)
+    best_P = 0.0 + 0.0j
+    best_mag = -1.0
+    for d in range(d_lo, d_hi):
+        a = x[:, d : d + cp_len]
+        b = x[:, d + n_fft : d + n_fft + cp_len]
+        P = np.sum(a * np.conj(b))
+        mag = float(np.abs(P))
+        if mag > best_mag:
+            best_mag = mag
+            best_P = P
+    angle = np.angle(best_P)
+    cfo_hz = -angle * fs_hz / (2 * np.pi * n_fft)
+    return float(cfo_hz)
+
+
+def estimate_cfo_from_cp_peak_with_index(
+    rx: np.ndarray,
+    cp_start_est: int,
+    n_fft: int,
+    cp_len: int,
+    fs_hz: float,
+    span: int | None = None,
+) -> tuple[float, int]:
+    """Like estimate_cfo_from_cp_peak, but also return the best CP offset index used."""
+    x = np.asarray(rx)
+    if x.ndim == 1:
+        x = x[np.newaxis, :]
+    L = x.shape[1]
+    span = cp_len // 2 if span is None else int(max(0, span))
+    d_lo = max(0, cp_start_est - span)
+    d_hi = min(L - (n_fft + cp_len), cp_start_est + span)
+    if d_hi <= d_lo:
+        return estimate_cfo_from_cp(x, cp_start_est, n_fft, cp_len, fs_hz), cp_start_est
+    best_P = 0.0 + 0.0j
+    best_mag = -1.0
+    best_d = d_lo
+    for d in range(d_lo, d_hi):
+        a = x[:, d : d + cp_len]
+        b = x[:, d + n_fft : d + n_fft + cp_len]
+        P = np.sum(a * np.conj(b))
+        mag = float(np.abs(P))
+        if mag > best_mag:
+            best_mag = mag
+            best_P = P
+            best_d = d
+    angle = np.angle(best_P)
+    cfo_hz = -angle * fs_hz / (2 * np.pi * n_fft)
+    return float(cfo_hz), int(best_d)
 
 
 def find_cp_start_via_corr(

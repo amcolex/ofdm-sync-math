@@ -77,30 +77,37 @@ def sc_streaming_metric(rx: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndar
     return M, P_sum, R_sum
 
 
-def find_plateau_end_from_metric(M: np.ndarray, smooth_win: int, n_fft: int) -> int:
+def find_plateau_end_from_metric(
+    M: np.ndarray, cp_len: int, lookahead: int | None = None, smooth_win: int = 8
+) -> int:
+    """Find plateau end (N start) using a look-ahead drop on smoothed M.
+
+    Computes drop(d) = Ms[d] - Ms[d+L] over a local search window around the
+    plateau center, where L is a small lookahead (default cp_len/4). The end
+    index is approximated as d + L/2 at the maximum drop.
+    """
     if M.size == 0:
         return 0
+    L = (cp_len // 4) if lookahead is None else int(max(1, lookahead))
     w = max(1, smooth_win)
-    kernel = np.ones(w, dtype=float) / w
-    Ms = np.convolve(M, kernel, mode="same")
-    dM = np.diff(Ms)
+    Ms = np.convolve(M, np.ones(w, dtype=float) / w, mode="same")
     center = int(np.argmax(Ms))
-    search_radius = n_fft // 4
-    lo = max(1, center - search_radius)
-    hi = min(dM.size - 1, center + search_radius)
-    if hi <= lo:
-        drop_idx = int(np.argmin(dM))
-    else:
-        local = dM[lo:hi]
-        drop_idx = int(lo + np.argmin(local))
-    plateau_end = drop_idx + 1
+    lo = max(0, center - cp_len)
+    hi = min(Ms.size - L - 1, center + cp_len)
+    window = Ms[lo:hi]
+    ahead = Ms[lo + L : hi + L]
+    drop = window - ahead
+    if drop.size == 0:
+        return center
+    d_rel = int(np.argmax(drop))
+    plateau_end = lo + d_rel + (L // 2)
     return plateau_end
 
 
 # Detector and channel parameters (script-local)
-SNR_DB = 35.0
+SNR_DB = 10.0
 CFO_HZ = 1000.0
-SC_DELTA = 12  # step back from plateau end to sit inside CP (8–16 suggested)
+SC_DELTA = 0  # step back from plateau end to sit inside CP (8–16 suggested)
 SMOOTH_WIN = 32  # samples for smoothing M(d) before slope detection
 
 # Output paths
@@ -113,7 +120,7 @@ CIR_PLOT_PATH = PLOTS_DIR / "channel_cir.png"
 CONST_PLOT_PATH = PLOTS_DIR / "constellation.png"
 
 # Channel profile (set to 'cir1' or 'cir2' to enable measured CIR)
-CHANNEL_PROFILE = None
+CHANNEL_PROFILE = "cir1"
 CHANNEL_RX_INDICES: tuple[int, ...] | None = (0, 1)
 
 
@@ -157,7 +164,7 @@ def run_simulation():
 
     # Detection metric (S&C)
     M, P_sum, R_sum = sc_streaming_metric(rx_samples)
-    plateau_end = find_plateau_end_from_metric(M, SMOOTH_WIN, N_FFT)
+    plateau_end = find_plateau_end_from_metric(M, CYCLIC_PREFIX, lookahead=CYCLIC_PREFIX // 4, smooth_win=8)
     coarse_start = max(plateau_end - SC_DELTA, 0)
 
     # Ground-truth alignment helpers
@@ -221,23 +228,29 @@ def run_simulation():
     # --- CFO estimation from pilot (CP correlation) ---
     # plateau_end approximates the end of CP and start of N for the preamble
     preamble_n_start_est = plateau_end
-    pilot_cp_nom = preamble_n_start_est + N_FFT
-    from core import find_cp_start_via_corr
-    pilot_cp_start = find_cp_start_via_corr(
-        rx_samples, pilot_cp_nom, N_FFT, CYCLIC_PREFIX, search_half=2 * CYCLIC_PREFIX
-    )
+    # Do not refine with correlation search; rely on plateau edge only
+    pilot_cp_start = preamble_n_start_est + N_FFT
     data_cp_start = pilot_cp_start + pilot_symbol.size
-    cfo_est_hz = estimate_cfo_from_cp(rx_samples, pilot_cp_start, N_FFT, CYCLIC_PREFIX, SAMPLE_RATE_HZ)
+    from core import estimate_cfo_from_cp_peak_with_index
+    cfo_est_hz, pilot_cp_best = estimate_cfo_from_cp_peak_with_index(
+        rx_samples,
+        pilot_cp_start,
+        N_FFT,
+        CYCLIC_PREFIX,
+        SAMPLE_RATE_HZ,
+        span=CYCLIC_PREFIX // 2,
+    )
     # Compensate CFO across entire stream
     rx_cfo_corr = apply_cfo(rx_samples, -cfo_est_hz, SAMPLE_RATE_HZ)
 
     # --- Channel LS estimate from pilot ---
     rx_eff = rx_cfo_corr if rx_cfo_corr.ndim == 1 else np.mean(rx_cfo_corr, axis=0)
-    pilot_td = rx_eff[pilot_cp_start + CYCLIC_PREFIX : pilot_cp_start + CYCLIC_PREFIX + N_FFT]
+    pilot_td = rx_eff[pilot_cp_best + CYCLIC_PREFIX : pilot_cp_best + CYCLIC_PREFIX + N_FFT]
     y_pilot_used = ofdm_fft_used(pilot_td)
     h_est = ls_channel_estimate(y_pilot_used, pilot_used)
 
     # --- Equalize data symbol and compute EVM ---
+    data_cp_start = pilot_cp_best + CYCLIC_PREFIX + N_FFT
     data_td = rx_eff[data_cp_start + CYCLIC_PREFIX : data_cp_start + CYCLIC_PREFIX + N_FFT]
     y_data_used = ofdm_fft_used(data_td)
     xhat = equalize(y_data_used, h_est)

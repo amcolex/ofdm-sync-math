@@ -46,7 +46,7 @@ def build_pss_symbol(include_cp: bool = True) -> np.ndarray:
 
 
 # Script-local parameters
-SNR_DB = 35.0
+SNR_DB = 10.0
 CFO_HZ = 1000.0
 
 PLOTS_DIR = Path("plots") / "zc"
@@ -57,7 +57,7 @@ RESULTS_PLOT_PATH = PLOTS_DIR / "start_detection.png"
 CIR_PLOT_PATH = PLOTS_DIR / "channel_cir.png"
 CONST_PLOT_PATH = PLOTS_DIR / "constellation.png"
 
-CHANNEL_PROFILE = None # Set to None to bypass measured CIR
+CHANNEL_PROFILE = "cir1" # Set to None to bypass measured CIR
 CHANNEL_RX_INDICES: tuple[int, ...] | None = (0, 1)
 
 
@@ -174,11 +174,8 @@ def run_simulation():
 
     # --- CFO estimation from pilot (CP correlation) ---
     # detected_start aligns to start of the N-length part of the preamble
-    pilot_cp_nom = detected_start + N_FFT
-    from core import find_cp_start_via_corr
-    pilot_cp_start = find_cp_start_via_corr(
-        rx_samples, pilot_cp_nom, N_FFT, CYCLIC_PREFIX, search_half=2 * CYCLIC_PREFIX
-    )
+    # Do not refine with correlation search; rely on ZC timing only
+    pilot_cp_start = detected_start + N_FFT
     data_cp_start = pilot_cp_start + pilot_symbol.size
     cfo_est_hz = estimate_cfo_from_cp(rx_samples, pilot_cp_start, N_FFT, CYCLIC_PREFIX, SAMPLE_RATE_HZ)
     # Compensate CFO across entire stream
