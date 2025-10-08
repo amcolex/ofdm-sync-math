@@ -316,12 +316,15 @@ def run_simulation(channel_name: str | None, plots_subdir: str):
     frame = np.concatenate((minn_preamble, pilot_symbol, data_symbol))
     tx_samples = np.concatenate((np.zeros(TX_PRE_PAD_SAMPLES, dtype=complex), frame))
     
-    # Channel: use only ch1 (index 1) for SISO when a profile is set
+    # Channel: use all available RX branches from the measured CIR (default to first two)
     if channel_name is None:
         channel_impulse_response = None
     else:
         cir_bank = load_measured_cir(channel_name)
-        channel_impulse_response = cir_bank[1:2]  # shape (1, taps)
+        if cir_bank.shape[0] > 2:
+            channel_impulse_response = cir_bank[:2].copy()
+        else:
+            channel_impulse_response = cir_bank.copy()
     
     rx_samples = apply_channel(
         tx_samples,
@@ -508,8 +511,10 @@ def run_simulation(channel_name: str | None, plots_subdir: str):
     print(f"Transmit sequence length: {tx_samples.size} samples")
     print(f"Receive branches: {1 if rx_samples.ndim == 1 else rx_samples.shape[0]}")
     if channel_impulse_response is not None:
+        num_rx = channel_impulse_response.shape[0]
         print(
-            f"Applied measured channel '{channel_name}' (ch1 only) taps={channel_impulse_response.shape[1]} main-path offset={channel_peak_offset}",
+            f"Applied measured channel '{channel_name}' using {num_rx} RX branch(es) "
+            f"taps={channel_impulse_response.shape[1]} main-path offset={channel_peak_offset}",
         )
     else:
         print("Channel profile: Flat AWGN (no multipath)")
