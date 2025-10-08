@@ -50,21 +50,29 @@ def build_pss_symbol(include_cp: bool = True) -> np.ndarray:
 SNR_DB = 10.0
 CFO_HZ = 1000.0
 
-PLOTS_DIR = Path("plots") / "zc"
-CORR_PLOT_PATH = PLOTS_DIR / "correlation.png"
-TX_PLOT_PATH = PLOTS_DIR / "tx_frame_time.png"
-RX_PLOT_PATH = PLOTS_DIR / "rx_frame_time.png"
-RESULTS_PLOT_PATH = PLOTS_DIR / "start_detection.png"
-CIR_PLOT_PATH = PLOTS_DIR / "channel_cir.png"
-CONST_PLOT_PATH = PLOTS_DIR / "constellation.png"
-
-# Measured channel fixed to 'cir1' ch1 (SISO). Set to None for AWGN-only.
-MEASURED_CHANNEL_NAME = "cir1"
+# Base output directory
+PLOTS_BASE_DIR = Path("plots") / "zc"
 
 
-def run_simulation():
+def run_simulation(channel_name: str | None, plots_subdir: str):
+    """Run Zadoff-Chu preamble synchronization simulation.
+    
+    Args:
+        channel_name: Name of measured channel profile (e.g., 'cir1') or None for AWGN-only
+        plots_subdir: Subdirectory name for plots (e.g., 'measured_channel' or 'flat_awgn')
+    """
     rng = np.random.default_rng(0)
-    PLOTS_DIR.mkdir(parents=True, exist_ok=True)
+    
+    # Setup output directory
+    plots_dir = PLOTS_BASE_DIR / plots_subdir
+    plots_dir.mkdir(parents=True, exist_ok=True)
+    
+    corr_plot_path = plots_dir / "correlation.png"
+    tx_plot_path = plots_dir / "tx_frame_time.png"
+    rx_plot_path = plots_dir / "rx_frame_time.png"
+    results_plot_path = plots_dir / "start_detection.png"
+    cir_plot_path = plots_dir / "channel_cir.png"
+    const_plot_path = plots_dir / "constellation.png"
 
     pss_waveform = build_pss_symbol(include_cp=True)
     pilot_symbol, pilot_used = build_random_qpsk_symbol(rng, include_cp=True)
@@ -73,10 +81,10 @@ def run_simulation():
     tx_samples = np.concatenate((np.zeros(TX_PRE_PAD_SAMPLES, dtype=complex), frame))
 
     # Channel: use only ch1 (index 1) for SISO when a profile is set
-    if MEASURED_CHANNEL_NAME is None:
+    if channel_name is None:
         channel_impulse_response = None
     else:
-        cir_bank = load_measured_cir(MEASURED_CHANNEL_NAME)
+        cir_bank = load_measured_cir(channel_name)
         channel_impulse_response = cir_bank[1:2]  # shape (1, taps)
 
     rx_samples = apply_channel(
@@ -116,23 +124,25 @@ def run_simulation():
     if channel_impulse_response is not None:
         plot_time_series(
             channel_impulse_response,
-            f"Measured Channel CIR ('{MEASURED_CHANNEL_NAME}', ch1)",
-            CIR_PLOT_PATH,
+            f"Measured Channel CIR ('{channel_name}', ch1)",
+            cir_plot_path,
         )
 
     true_start = TX_PRE_PAD_SAMPLES + channel_peak_offset + pss_reference_lead
     expected_peak_index = true_start + pss_reference.size - 1
     timing_error = detected_start - true_start
 
+    channel_desc = f"Measured CIR '{channel_name}'" if channel_name else "Flat AWGN"
+    
     plt.figure(figsize=(10, 4))
     plt.plot(correlation_mag)
     plt.axvline(peak_index, color="tab:red", linestyle="--", label=f"Peak @ {peak_index}")
-    plt.title("Cross-correlation with ZC PSS Reference")
+    plt.title(f"Cross-correlation with ZC PSS Reference ({channel_desc})")
     plt.xlabel("Sample index")
     plt.ylabel("|normalized corr|")
     plt.legend()
     plt.tight_layout()
-    plt.savefig(CORR_PLOT_PATH, dpi=150)
+    plt.savefig(corr_plot_path, dpi=150)
     plt.close()
 
     fig, axes = plt.subplots(2, 1, figsize=(10, 6), sharex=False)
@@ -145,7 +155,7 @@ def run_simulation():
     axes[0].axvline(true_start, color="tab:green", linestyle="--", label="Expected ZC start")
     axes[0].axvline(detected_start, color="tab:red", linestyle=":", label="Detected ZC start")
     axes[0].set_ylabel("Magnitude")
-    axes[0].set_title("Received Magnitude with Start Detection")
+    axes[0].set_title(f"Received Magnitude with Start Detection (ZC, {channel_desc})")
     axes[0].legend(loc="upper right")
 
     axes[1].plot(correlation_mag, label="Combined normalized |corr|")
@@ -157,11 +167,11 @@ def run_simulation():
     axes[1].legend(loc="upper right")
 
     fig.tight_layout()
-    fig.savefig(RESULTS_PLOT_PATH, dpi=150)
+    fig.savefig(results_plot_path, dpi=150)
     plt.close(fig)
 
-    plot_time_series(tx_samples, "Transmit Frame (with Leading Zeros)", TX_PLOT_PATH)
-    plot_time_series(rx_samples, "Received Frame After Channel", RX_PLOT_PATH)
+    plot_time_series(tx_samples, "Transmit Frame (with Leading Zeros)", tx_plot_path)
+    plot_time_series(rx_samples, f"Received Frame After Channel ({channel_desc})", rx_plot_path)
 
     # --- CFO estimation from pilot (CP correlation) ---
     # detected_start aligns to start of the N-length part of the preamble
@@ -189,40 +199,65 @@ def run_simulation():
     from core import align_complex_gain
     xhat_aligned, gain = align_complex_gain(xhat, data_used)
     evm_rms, evm_db = evm_rms_db(xhat_aligned, data_used)
-    plot_constellation(xhat_aligned, data_used, CONST_PLOT_PATH, "Equalized Data Constellation (ZC)")
+    plot_constellation(xhat_aligned, data_used, const_plot_path, f"Equalized Data Constellation (ZC, {channel_desc})")
 
+    peak_error = peak_index - expected_peak_index
+    print(f"\n{'='*70}")
+    print(f"ZADOFF-CHU SYNCHRONIZATION RESULTS - {channel_desc.upper()}")
+    print(f"{'='*70}")
     print(f"Frame length (without pad): {frame.size} samples")
     print(f"Transmit sequence length: {tx_samples.size} samples")
     print(f"Receive branches: {num_branches}")
     if channel_impulse_response is not None:
         print(
-            f"Applied measured channel '{MEASURED_CHANNEL_NAME}' (ch1 only) taps={channel_impulse_response.shape[1]} main-path offset={channel_peak_offset}",
+            f"Applied measured channel '{channel_name}' (ch1 only) taps={channel_impulse_response.shape[1]} main-path offset={channel_peak_offset}",
         )
     else:
-        print("Channel profile disabled (AWGN only)")
-    peak_error = peak_index - expected_peak_index
-    print(f"Matched filter peak index: {peak_index}")
-    print(f"Expected peak index: {expected_peak_index}")
-    print(f"Detected ZC start sample: {detected_start}")
-    print(f"Timing error (detected - expected): {timing_error} samples")
-    print(f"Peak index error (detected - expected): {peak_error} samples")
-    print(f"Saved correlation plot to {CORR_PLOT_PATH.resolve()}")
-    print(f"Saved transmit time series plot to {TX_PLOT_PATH.resolve()}")
-    print(f"Saved receive time series plot to {RX_PLOT_PATH.resolve()}")
-    print(f"Saved start detection plot to {RESULTS_PLOT_PATH.resolve()}")
+        print("Channel profile: Flat AWGN (no multipath)")
+    print(f"\nTiming Detection:")
+    print(f"  Matched filter peak index: {peak_index}")
+    print(f"  Expected peak index: {expected_peak_index}")
+    print(f"  Detected ZC start sample: {detected_start}")
+    print(f"  Timing error: {timing_error} samples ({abs(timing_error)/N_FFT*100:.1f}% of symbol)")
+    print(f"  Peak index error: {peak_error} samples")
+    print(f"\nCarrier Frequency Offset:")
+    print(f"  Applied CFO: {CFO_HZ} Hz")
+    print(f"  Estimated CFO from CP: {cfo_est_hz:.2f} Hz")
+    print(f"  CFO error: {abs(cfo_est_hz - CFO_HZ):.2f} Hz ({abs(cfo_est_hz - CFO_HZ)/CFO_HZ*100:.1f}%)")
+    print(f"\nChannel Estimation & Equalization:")
+    print(f"  Pilot LS phase slope: {slope_rad_per_bin:.6f} rad/bin -> timing ≈ {timing_offset_samples:.2f} samples")
+    print(f"  Post-EQ complex gain (mag, angle): {np.abs(gain):.3f}, {np.angle(gain):.3f} rad")
+    print(f"  EVM RMS: {100*evm_rms:.2f}%  ({evm_db:.2f} dB)")
+    print(f"\nPlots saved to {plots_dir.resolve()}/:")
+    print(f"  - correlation.png")
+    print(f"  - start_detection.png")
+    print(f"  - constellation.png")
+    print(f"  - tx_frame_time.png")
+    print(f"  - rx_frame_time.png")
     if channel_impulse_response is not None:
-        print(f"Saved channel CIR plot to {CIR_PLOT_PATH.resolve()}")
-    print(f"Applied CFO: {CFO_HZ} Hz at Fs={SAMPLE_RATE_HZ} Hz")
-    print(f"Estimated CFO from CP: {cfo_est_hz:.2f} Hz")
-    print(
-        f"Pilot LS phase slope: {slope_rad_per_bin:.6f} rad/bin -> timing ≈ {timing_offset_samples:.2f} samples",
-    )
-    print(f"Post-EQ complex gain (mag, angle): {np.abs(gain):.3f}, {np.angle(gain):.3f} rad")
-    print(f"EVM RMS: {100*evm_rms:.2f}%  ({evm_db:.2f} dB)")
+        print(f"  - channel_cir.png")
+    print(f"{'='*70}\n")
 
 
 def main():
-    run_simulation()
+    """Run simulations for both measured channel and flat AWGN conditions."""
+    print("\n" + "="*70)
+    print("ZADOFF-CHU SYNCHRONIZATION - DUAL CONDITION ANALYSIS")
+    print("="*70)
+    
+    # Simulation 1: Measured multipath channel
+    run_simulation(channel_name="cir1", plots_subdir="measured_channel")
+    
+    # Simulation 2: Flat AWGN channel
+    run_simulation(channel_name=None, plots_subdir="flat_awgn")
+    
+    print("\n" + "="*70)
+    print("ALL SIMULATIONS COMPLETE")
+    print("="*70)
+    print(f"\nCompare results in:")
+    print(f"  - {(PLOTS_BASE_DIR / 'measured_channel').resolve()}")
+    print(f"  - {(PLOTS_BASE_DIR / 'flat_awgn').resolve()}")
+    print("="*70 + "\n")
 
 
 if __name__ == "__main__":
