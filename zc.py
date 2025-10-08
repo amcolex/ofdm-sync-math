@@ -80,12 +80,15 @@ def run_simulation(channel_name: str | None, plots_subdir: str):
     frame = np.concatenate((pss_waveform, pilot_symbol, data_symbol))
     tx_samples = np.concatenate((np.zeros(TX_PRE_PAD_SAMPLES, dtype=complex), frame))
 
-    # Channel: use only ch1 (index 1) for SISO when a profile is set
+    # Channel: use all available RX branches from the measured CIR (default to first two)
     if channel_name is None:
         channel_impulse_response = None
     else:
         cir_bank = load_measured_cir(channel_name)
-        channel_impulse_response = cir_bank[1:2]  # shape (1, taps)
+        if cir_bank.shape[0] > 2:
+            channel_impulse_response = cir_bank[:2].copy()
+        else:
+            channel_impulse_response = cir_bank.copy()
 
     rx_samples = apply_channel(
         tx_samples,
@@ -95,6 +98,8 @@ def run_simulation(channel_name: str | None, plots_subdir: str):
     )
     # Apply CFO to simulate LO mismatch at the receiver
     rx_samples = apply_cfo(rx_samples, CFO_HZ, SAMPLE_RATE_HZ)
+    if rx_samples.ndim == 1:
+        rx_samples = rx_samples[np.newaxis, :]
 
     num_branches = rx_samples.shape[0]
     pss_reference = build_pss_symbol(include_cp=False)
@@ -104,16 +109,22 @@ def run_simulation(channel_name: str | None, plots_subdir: str):
     corr_eps = 1e-12
     window = np.ones(pss_reference.size, dtype=float)
 
-    normalized_corr = []
+    numerator_sum: np.ndarray | None = None
+    power_sum: np.ndarray | None = None
     for branch in rx_samples:
         numerator = np.convolve(branch, pss_conj)
         branch_power = np.convolve(np.abs(branch) ** 2, window)
-        denom = reference_norm * np.sqrt(branch_power + corr_eps)
-        normalized = numerator / denom
-        normalized_corr.append(normalized)
-    normalized_corr = np.stack(normalized_corr)
+        if numerator_sum is None:
+            numerator_sum = numerator
+            power_sum = branch_power
+        else:
+            numerator_sum += numerator
+            power_sum += branch_power
+    assert numerator_sum is not None and power_sum is not None  # branches > 0
+    denom = reference_norm * np.sqrt(np.maximum(power_sum, 0.0) + corr_eps)
+    combined_corr = numerator_sum / denom
 
-    correlation_mag = np.sqrt(np.sum(np.abs(normalized_corr) ** 2, axis=0) / num_branches)
+    correlation_mag = np.abs(combined_corr)
     peak_index = int(np.argmax(correlation_mag))
     detected_start = max(peak_index - pss_reference.size + 1, 0)
 
@@ -124,7 +135,7 @@ def run_simulation(channel_name: str | None, plots_subdir: str):
     if channel_impulse_response is not None:
         plot_time_series(
             channel_impulse_response,
-            f"Measured Channel CIR ('{channel_name}', ch1)",
+            f"Measured Channel CIR ('{channel_name}', all RX)",
             cir_plot_path,
         )
 
@@ -210,7 +221,8 @@ def run_simulation(channel_name: str | None, plots_subdir: str):
     print(f"Receive branches: {num_branches}")
     if channel_impulse_response is not None:
         print(
-            f"Applied measured channel '{channel_name}' (ch1 only) taps={channel_impulse_response.shape[1]} main-path offset={channel_peak_offset}",
+            f"Applied measured channel '{channel_name}' using {channel_impulse_response.shape[0]} RX branch(es) "
+            f"taps={channel_impulse_response.shape[1]} main-path offset={channel_peak_offset}",
         )
     else:
         print("Channel profile: Flat AWGN (no multipath)")
@@ -262,4 +274,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

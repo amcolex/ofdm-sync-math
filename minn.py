@@ -296,6 +296,20 @@ def run_simulation(channel_name: str | None, plots_subdir: str):
         channel_name: Name of measured channel profile (e.g., 'cir1') or None for AWGN-only
         plots_subdir: Subdirectory name for plots (e.g., 'measured_channel' or 'flat_awgn')
     """
+    def mask_segments(mask: np.ndarray) -> list[tuple[int, int]]:
+        """Return contiguous [start, end) segments where mask is True."""
+        segments: list[tuple[int, int]] = []
+        start_idx: int | None = None
+        for idx, flag in enumerate(mask):
+            if flag and start_idx is None:
+                start_idx = idx
+            elif not flag and start_idx is not None:
+                segments.append((start_idx, idx))
+                start_idx = None
+        if start_idx is not None:
+            segments.append((start_idx, mask.size))
+        return segments
+    
     rng = np.random.default_rng(0)
     
     # Setup output directory
@@ -339,43 +353,26 @@ def run_simulation(channel_name: str | None, plots_subdir: str):
     M, P_sum, R_sum = minn_streaming_metric(rx_samples)
     M_sc, P_sc, R_sc = schmidl_cox_streaming_metric(rx_samples)
     
-    sc_gate_bounds: tuple[int, int] | None = None
     sc_gate_mask: np.ndarray | None = None
+    sc_gate_span: tuple[int, int] | None = None
     sc_norm: np.ndarray | None = None
-    max_sc = 0.0
     if M_sc.size > 0:
         max_sc = float(np.max(M_sc))
         if max_sc > 0:
             sc_norm = M_sc / max_sc
-            sc_plateau_mask = sc_norm >= SC_GATE_THRESHOLD
-            if np.any(sc_plateau_mask):
-                best_len = 0
-                best_bounds: tuple[int, int] | None = None
-                start_idx: int | None = None
-                for idx, flag in enumerate(sc_plateau_mask):
-                    if flag and start_idx is None:
-                        start_idx = idx
-                    elif not flag and start_idx is not None:
-                        length = idx - start_idx
-                        if length > best_len:
-                            best_len = length
-                            best_bounds = (start_idx, idx)
-                        start_idx = None
-                if start_idx is not None:
-                    length = sc_plateau_mask.size - start_idx
-                    if length > best_len:
-                        best_len = length
-                        best_bounds = (start_idx, sc_plateau_mask.size)
-                if best_bounds is not None and best_len > 0:
-                    sc_gate_bounds = best_bounds
-                    sc_gate_mask = np.zeros_like(sc_plateau_mask, dtype=bool)
-                    sc_gate_mask[best_bounds[0] : best_bounds[1]] = True
+            sc_gate_mask = sc_norm >= SC_GATE_THRESHOLD
+        else:
+            sc_gate_mask = M_sc >= SC_GATE_THRESHOLD
+        if sc_gate_mask is not None and np.any(sc_gate_mask):
+            first_idx = int(np.argmax(sc_gate_mask))
+            last_idx = int(sc_gate_mask.size - np.argmax(sc_gate_mask[::-1]) - 1)
+            sc_gate_span = (first_idx, last_idx + 1)
     
     peak_position = find_minn_peak(
         M,
         smooth_win=SMOOTH_WIN,
         gate_mask=sc_gate_mask,
-        search_bounds=sc_gate_bounds,
+        search_bounds=None,
     )
     
     # The Minn peak aligns to the start of the N-length symbol (CP end)
@@ -394,7 +391,7 @@ def run_simulation(channel_name: str | None, plots_subdir: str):
     if channel_impulse_response is not None:
         plot_time_series(
             channel_impulse_response,
-            f"Measured Channel CIR ('{channel_name}', ch1)",
+            f"Measured Channel CIR ('{channel_name}', all RX)",
             cir_plot_path,
         )
     
@@ -408,11 +405,16 @@ def run_simulation(channel_name: str | None, plots_subdir: str):
     plt.figure(figsize=(10, 4))
     if sc_norm is not None:
         plt.plot(sc_norm, label="S&C M(d) (norm)", color="tab:blue", linestyle="-")
-        if sc_gate_bounds is not None:
-            gate_label = f"S&C gate (≥{SC_GATE_THRESHOLD:.0%})"
-            plt.axvspan(sc_gate_bounds[0], sc_gate_bounds[1], color="tab:blue", alpha=0.12, label=gate_label)
+        if sc_gate_mask is not None and np.any(sc_gate_mask):
+            for idx, (seg_start, seg_end) in enumerate(mask_segments(sc_gate_mask)):
+                gate_label = f"S&C gate (≥{SC_GATE_THRESHOLD:.0%})" if idx == 0 else None
+                plt.axvspan(seg_start, seg_end, color="tab:blue", alpha=0.15, label=gate_label)
     elif M_sc.size > 0:
         plt.plot(M_sc, label="S&C M(d)", color="tab:blue", linestyle="-")
+        if sc_gate_mask is not None and np.any(sc_gate_mask):
+            for idx, (seg_start, seg_end) in enumerate(mask_segments(sc_gate_mask)):
+                gate_label = f"S&C gate (≥{SC_GATE_THRESHOLD:.0%})" if idx == 0 else None
+                plt.axvspan(seg_start, seg_end, color="tab:blue", alpha=0.15, label=gate_label)
     if minn_norm is not None:
         plt.plot(minn_norm, label="Minn M(d) (norm)", color="tab:orange")
     else:
@@ -436,6 +438,10 @@ def run_simulation(channel_name: str | None, plots_subdir: str):
     if rx_samples.ndim > 1 and rx_samples.shape[0] > 1:
         for idx, branch in enumerate(rx_samples):
             axes[0].plot(np.abs(branch), alpha=0.3, linewidth=0.8)
+    if sc_gate_mask is not None and np.any(sc_gate_mask):
+        for idx, (seg_start, seg_end) in enumerate(mask_segments(sc_gate_mask)):
+            gate_label = "S&C gate" if idx == 0 else None
+            axes[0].axvspan(seg_start, seg_end, color="tab:blue", alpha=0.2, label=gate_label)
     axes[0].axvline(true_cp_start, color="tab:purple", linestyle="--", label="CP start (true)")
     axes[0].axvline(expected_n_start, color="tab:green", linestyle="--", label="N start (exp)")
     axes[0].axvline(detected_start, color="tab:red", linestyle=":", label="Detected start")
@@ -445,10 +451,14 @@ def run_simulation(channel_name: str | None, plots_subdir: str):
     
     if sc_norm is not None:
         axes[1].plot(sc_norm, label="S&C M(d) (norm)", color="tab:blue")
-        if sc_gate_bounds is not None:
-            axes[1].axvspan(sc_gate_bounds[0], sc_gate_bounds[1], color="tab:blue", alpha=0.12)
+        if sc_gate_mask is not None and np.any(sc_gate_mask):
+            for seg_start, seg_end in mask_segments(sc_gate_mask):
+                axes[1].axvspan(seg_start, seg_end, color="tab:blue", alpha=0.12)
     elif M_sc.size > 0:
         axes[1].plot(M_sc, label="S&C M(d)", color="tab:blue")
+        if sc_gate_mask is not None and np.any(sc_gate_mask):
+            for seg_start, seg_end in mask_segments(sc_gate_mask):
+                axes[1].axvspan(seg_start, seg_end, color="tab:blue", alpha=0.12)
     if minn_norm is not None:
         axes[1].plot(minn_norm, label="Minn M(d) (norm)", color="tab:orange")
     else:
@@ -522,10 +532,14 @@ def run_simulation(channel_name: str | None, plots_subdir: str):
     print(f"  Detected Minn peak at d={peak_position}")
     print(f"  Expected N start at d={expected_n_start}")
     print(f"  Timing error: {timing_error} samples ({abs(timing_error)/N_FFT*100:.1f}% of symbol)")
-    if sc_gate_bounds is not None:
-        gate_start, gate_end = sc_gate_bounds
+    if sc_gate_span is not None:
+        gate_start, gate_end = sc_gate_span
         print(
             f"  S&C gate window: [{gate_start}, {gate_end}) (norm ≥ {SC_GATE_THRESHOLD:.0%}, span {gate_end - gate_start} samples)",
+        )
+    elif sc_gate_mask is not None:
+        print(
+            f"  S&C gate not triggered (no samples reached threshold {SC_GATE_THRESHOLD:.0%})",
         )
     print(f"\nCarrier Frequency Offset:")
     print(f"  Applied CFO: {CFO_HZ} Hz")
