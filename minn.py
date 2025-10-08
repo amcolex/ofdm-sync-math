@@ -164,9 +164,66 @@ def schmidl_cox_streaming_metric(rx: np.ndarray, symbol_len: int = N_FFT) -> tup
     return M_sc, P_sum, R_sum
 
 
+def _trailing_average(x: np.ndarray, win: int) -> np.ndarray:
+    """Compute trailing moving average using only past samples (streaming-friendly)."""
+    if win <= 1:
+        return x.copy()
+    
+    y = np.empty_like(x, dtype=float)
+    acc = 0.0
+    for idx, val in enumerate(x):
+        acc += val
+        if idx >= win:
+            acc -= x[idx - win]
+        denom = win if idx >= win - 1 else (idx + 1)
+        y[idx] = acc / denom
+    return y
+
+
+def _streaming_peak_detector(
+    metric: np.ndarray,
+    gate_mask: np.ndarray | None = None,
+    drop_ratio: float = 0.05,
+    hold_samples: int = 8,
+) -> int | None:
+    """Streaming-inspired peak detector with optional gating mask."""
+    best_val = -np.inf
+    best_idx = 0
+    hold_ctr = 0
+    gate_active = False
+    
+    for idx, val in enumerate(metric):
+        gate_flag = gate_mask[idx] if gate_mask is not None else True
+        
+        if gate_flag:
+            if not gate_active:
+                gate_active = True
+                best_val = val
+                best_idx = idx
+                hold_ctr = 0
+            else:
+                if val > best_val:
+                    best_val = val
+                    best_idx = idx
+                    hold_ctr = 0
+                else:
+                    hold_ctr += 1
+                    threshold_drop = best_val * (1.0 - drop_ratio)
+                    if gate_mask is None and hold_ctr >= hold_samples and val < threshold_drop:
+                        return best_idx
+        else:
+            if gate_active:
+                return best_idx
+    
+    if gate_active:
+        return best_idx
+    return None
+
+
 def find_minn_peak(
     M: np.ndarray,
     smooth_win: int = 8,
+    gate_mask: np.ndarray | None = None,
     search_bounds: tuple[int, int] | None = None,
 ) -> int:
     """Find timing from Minn metric.
@@ -177,9 +234,13 @@ def find_minn_peak(
     if M.size == 0:
         return 0
     
-    # Smooth to reduce noise
-    w = max(1, smooth_win)
-    Ms = np.convolve(M, np.ones(w, dtype=float) / w, mode='same')
+    metric = np.asarray(M, dtype=float)
+    
+    gate = None
+    if gate_mask is not None:
+        if gate_mask.shape[0] != metric.shape[0]:
+            raise ValueError("gate_mask must match metric length")
+        gate = gate_mask.astype(bool, copy=False)
     
     if search_bounds is not None:
         start = max(0, search_bounds[0])
@@ -187,11 +248,27 @@ def find_minn_peak(
         if start >= end:
             start = 0
             end = M.size
+        if gate is None:
+            gate = np.zeros_like(metric, dtype=bool)
+        gate[start:end] = True
     else:
         start, end = 0, M.size
     
-    # Simply find the global maximum - this is where the window best aligns
-    # with the [A, A, -A, -A] structure
+    # Smooth using trailing average to keep streaming behavior (no future look-ahead)
+    w = max(1, smooth_win)
+    Ms = _trailing_average(np.maximum(metric, 0.0), win=w)
+    
+    # Streaming peak detection within gate
+    peak = _streaming_peak_detector(
+        Ms[start:end],
+        gate_mask=gate[start:end] if gate is not None else None,
+        drop_ratio=STREAM_DROP_RATIO,
+        hold_samples=STREAM_HOLD_SAMPLES,
+    )
+    if peak is not None:
+        return start + peak
+    
+    # Fallback to global maximum if streaming detector fails to trigger
     peak_idx = int(start + np.argmax(Ms[start:end]))
     
     # Adjust: The metric window of size N starts at d, so the detected position
@@ -205,6 +282,8 @@ SNR_DB = 10.0
 CFO_HZ = 1000.0
 SMOOTH_WIN = 16  # samples for smoothing M(d) before peak detection
 SC_GATE_THRESHOLD = 0.6  # normalized S&C metric threshold for gate
+STREAM_HOLD_SAMPLES = 12  # consecutive drops before locking peak (no gate)
+STREAM_DROP_RATIO = 0.04  # fractional drop to terminate search when ungated
 
 # Base output directory
 PLOTS_BASE_DIR = Path("plots") / "minn"
@@ -258,6 +337,7 @@ def run_simulation(channel_name: str | None, plots_subdir: str):
     M_sc, P_sc, R_sc = schmidl_cox_streaming_metric(rx_samples)
     
     sc_gate_bounds: tuple[int, int] | None = None
+    sc_gate_mask: np.ndarray | None = None
     sc_norm: np.ndarray | None = None
     max_sc = 0.0
     if M_sc.size > 0:
@@ -285,10 +365,13 @@ def run_simulation(channel_name: str | None, plots_subdir: str):
                         best_bounds = (start_idx, sc_plateau_mask.size)
                 if best_bounds is not None and best_len > 0:
                     sc_gate_bounds = best_bounds
+                    sc_gate_mask = np.zeros_like(sc_plateau_mask, dtype=bool)
+                    sc_gate_mask[best_bounds[0] : best_bounds[1]] = True
     
     peak_position = find_minn_peak(
         M,
         smooth_win=SMOOTH_WIN,
+        gate_mask=sc_gate_mask,
         search_bounds=sc_gate_bounds,
     )
     
