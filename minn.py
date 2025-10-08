@@ -180,42 +180,31 @@ def _trailing_average(x: np.ndarray, win: int) -> np.ndarray:
     return y
 
 
-def _streaming_peak_detector(
-    metric: np.ndarray,
-    gate_mask: np.ndarray | None = None,
-    drop_ratio: float = 0.05,
-    hold_samples: int = 8,
-) -> int | None:
-    """Streaming-inspired peak detector with optional gating mask."""
+def _streaming_peak_detector(metric: np.ndarray, gate_mask: np.ndarray) -> int | None:
+    """Return peak index using only past samples within an active gate."""
+    if gate_mask.shape[0] != metric.shape[0]:
+        raise ValueError("gate_mask must match metric length")
+    
+    best_idx: int | None = None
     best_val = -np.inf
-    best_idx = 0
-    hold_ctr = 0
     gate_active = False
     
     for idx, val in enumerate(metric):
-        gate_flag = gate_mask[idx] if gate_mask is not None else True
+        gate_flag = gate_mask[idx]
         
         if gate_flag:
             if not gate_active:
                 gate_active = True
                 best_val = val
                 best_idx = idx
-                hold_ctr = 0
             else:
                 if val > best_val:
                     best_val = val
                     best_idx = idx
-                    hold_ctr = 0
-                else:
-                    hold_ctr += 1
-                    threshold_drop = best_val * (1.0 - drop_ratio)
-                    if gate_mask is None and hold_ctr >= hold_samples and val < threshold_drop:
-                        return best_idx
-        else:
-            if gate_active:
-                return best_idx
+        elif gate_active:
+            return best_idx
     
-    if gate_active:
+    if gate_active or best_idx is not None:
         return best_idx
     return None
 
@@ -236,45 +225,38 @@ def find_minn_peak(
     
     metric = np.asarray(M, dtype=float)
     
-    gate = None
-    if gate_mask is not None:
-        if gate_mask.shape[0] != metric.shape[0]:
-            raise ValueError("gate_mask must match metric length")
-        gate = gate_mask.astype(bool, copy=False)
+    if gate_mask is None:
+        raise ValueError("Minn peak detection requires S&C gate mask")
+    if gate_mask.shape[0] != metric.shape[0]:
+        raise ValueError("gate_mask must match metric length")
+    
+    # Build boolean masks combining supplied gate and optional bounds
+    search_mask = gate_mask.astype(bool, copy=True)
     
     if search_bounds is not None:
         start = max(0, search_bounds[0])
         end = min(M.size, search_bounds[1])
         if start >= end:
-            start = 0
-            end = M.size
-        if gate is None:
-            gate = np.zeros_like(metric, dtype=bool)
-        gate[start:end] = True
-    else:
-        start, end = 0, M.size
+            start, end = 0, M.size
+        bounds_mask = np.zeros_like(metric, dtype=bool)
+        bounds_mask[start:end] = True
+        search_mask &= bounds_mask
+    
+    if not np.any(search_mask):
+        raise ValueError("Minn peak detector received empty gate region")
     
     # Smooth using trailing average to keep streaming behavior (no future look-ahead)
     w = max(1, smooth_win)
     Ms = _trailing_average(np.maximum(metric, 0.0), win=w)
     
-    # Streaming peak detection within gate
     peak = _streaming_peak_detector(
-        Ms[start:end],
-        gate_mask=gate[start:end] if gate is not None else None,
-        drop_ratio=STREAM_DROP_RATIO,
-        hold_samples=STREAM_HOLD_SAMPLES,
+        Ms,
+        gate_mask=search_mask,
     )
     if peak is not None:
-        return start + peak
+        return peak
     
-    # Fallback to global maximum if streaming detector fails to trigger
-    peak_idx = int(start + np.argmax(Ms[start:end]))
-    
-    # Adjust: The metric window of size N starts at d, so the detected position
-    # represents where the N-sample window starts. For Minn, this should align
-    # to the start of the useful symbol (after CP).
-    return peak_idx
+    raise RuntimeError("Streaming peak detector did not produce a peak")
 
 
 # Detector and channel parameters (script-local)
@@ -282,8 +264,6 @@ SNR_DB = 10.0
 CFO_HZ = 1000.0
 SMOOTH_WIN = 16  # samples for smoothing M(d) before peak detection
 SC_GATE_THRESHOLD = 0.6  # normalized S&C metric threshold for gate
-STREAM_HOLD_SAMPLES = 12  # consecutive drops before locking peak (no gate)
-STREAM_DROP_RATIO = 0.04  # fractional drop to terminate search when ungated
 
 # Base output directory
 PLOTS_BASE_DIR = Path("plots") / "minn"
@@ -363,11 +343,19 @@ def run_simulation(channel_name: str | None, plots_subdir: str):
             sc_gate_mask = sc_norm >= SC_GATE_THRESHOLD
         else:
             sc_gate_mask = M_sc >= SC_GATE_THRESHOLD
+        if sc_gate_mask is not None and not np.any(sc_gate_mask):
+            # Guarantee a valid gate by seeding it with the strongest S&C sample.
+            gate_idx = int(np.argmax(M_sc))
+            sc_gate_mask = np.zeros_like(sc_gate_mask, dtype=bool)
+            sc_gate_mask[gate_idx] = True
         if sc_gate_mask is not None and np.any(sc_gate_mask):
             first_idx = int(np.argmax(sc_gate_mask))
             last_idx = int(sc_gate_mask.size - np.argmax(sc_gate_mask[::-1]) - 1)
             sc_gate_span = (first_idx, last_idx + 1)
-    
+
+    if sc_gate_mask is None:
+        raise RuntimeError("Schmidl & Cox gate is required for Minn detector")
+
     peak_position = find_minn_peak(
         M,
         smooth_win=SMOOTH_WIN,
