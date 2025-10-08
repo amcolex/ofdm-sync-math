@@ -10,6 +10,7 @@ from core import (
     TX_PRE_PAD_SAMPLES,
     centered_subcarrier_indices,
     allocate_subcarriers,
+    spectrum_to_time_domain,
     add_cyclic_prefix,
     plot_time_series,
     compute_channel_peak_offset,
@@ -18,6 +19,7 @@ from core import (
     ofdm_fft_used,
     ls_channel_estimate,
     equalize,
+    remove_common_phase,
     evm_rms_db,
     plot_constellation,
     SAMPLE_RATE_HZ,
@@ -111,6 +113,57 @@ def minn_streaming_metric(rx: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.nd
     return M, P_sum, R_sum
 
 
+def schmidl_cox_streaming_metric(rx: np.ndarray, symbol_len: int = N_FFT) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Compute Schmidl & Cox timing metric for a symbol with two identical halves.
+    
+    The metric forms a plateau when the sliding window sits over the repeated
+    halves, which can be used to gate a finer peak search (e.g., Minn metric).
+    
+    Args:
+        rx: Received samples, shape (branches, L) or (L,)
+        symbol_len: Total length of the repeated symbol (default: N_FFT)
+    
+    Returns:
+        M_sc: Timing metric magnitude
+        P_sum: Complex correlation sum between halves
+        R_sum: Energy sum across halves
+    """
+    rx = np.asarray(rx)
+    if rx.ndim == 1:
+        rx = rx[np.newaxis, :]
+    
+    num_branches, L = rx.shape
+    half = symbol_len // 2
+    if half == 0 or symbol_len > L:
+        return np.zeros(0), np.zeros(0, dtype=np.complex128), np.zeros(0)
+    
+    out_len = L - symbol_len + 1
+    P_sum = np.zeros(out_len, dtype=np.complex128)
+    R_sum = np.zeros(out_len, dtype=np.float64)
+    
+    for b in range(num_branches):
+        x = rx[b]
+        Pb = np.empty(out_len, dtype=np.complex128)
+        Rb = np.empty(out_len, dtype=np.float64)
+        
+        for d in range(out_len):
+            first = x[d : d + half]
+            second = x[d + half : d + symbol_len]
+            
+            P = np.sum(first * np.conj(second))
+            R = np.sum(np.abs(first) ** 2 + np.abs(second) ** 2)
+            
+            Pb[d] = P
+            Rb[d] = R
+        
+        P_sum += Pb
+        R_sum += Rb
+    
+    eps = 1e-12
+    M_sc = (np.abs(P_sum) ** 2) / (np.maximum(R_sum, eps) ** 2)
+    return M_sc, P_sum, R_sum
+
+
 def _trailing_average(x: np.ndarray, win: int) -> np.ndarray:
     """Compute trailing moving average using only past samples (streaming-friendly)."""
     if win <= 1:
@@ -127,61 +180,59 @@ def _trailing_average(x: np.ndarray, win: int) -> np.ndarray:
     return y
 
 
+def _streaming_peak_detector(metric: np.ndarray, gate_mask: np.ndarray) -> int | None:
+    """Return peak index using only past samples within an active gate."""
+    if gate_mask.shape[0] != metric.shape[0]:
+        raise ValueError("gate_mask must match metric length")
+    
+    best_idx: int | None = None
+    best_val = -np.inf
+    gate_active = False
+    
+    for idx, val in enumerate(metric):
+        gate_flag = gate_mask[idx]
+        
+        if gate_flag:
+            if not gate_active:
+                gate_active = True
+                best_val = val
+                best_idx = idx
+            else:
+                if val > best_val:
+                    best_val = val
+                    best_idx = idx
+        elif gate_active:
+            return best_idx
+    
+    if gate_active or best_idx is not None:
+        return best_idx
+    return None
+
+
 def find_minn_peak(
     M: np.ndarray,
     smooth_win: int = 8,
-    gate_threshold: float = 0.5,
+    gate_mask: np.ndarray | None = None,
     search_bounds: tuple[int, int] | None = None,
-) -> tuple[int, np.ndarray, np.ndarray]:
+) -> int:
     """Find timing from Minn metric.
     
     The Minn metric creates a pattern where the peak occurs when the
     sliding window aligns with [A, A, -A, -A]. We find this peak position.
     """
     if M.size == 0:
-        raise ValueError("Minn metric is empty")
+        return 0
     
     metric = np.asarray(M, dtype=float)
-
-    # Smooth using trailing average to keep streaming behavior (no future look-ahead)
-    w = max(1, smooth_win)
-    Ms = _trailing_average(np.maximum(metric, 0.0), win=w)
     
-    max_ms = float(np.max(Ms))
-    if max_ms <= 0.0:
-        raise ValueError("Minn metric did not produce a positive peak")
-    gate_level = gate_threshold * max_ms
-    gate_mask = Ms >= gate_level
+    if gate_mask is None:
+        raise ValueError("Minn peak detection requires S&C gate mask")
+    if gate_mask.shape[0] != metric.shape[0]:
+        raise ValueError("gate_mask must match metric length")
     
-    # Ensure the gate is contiguous around the best peak by selecting the largest component
-    if np.any(gate_mask):
-        in_segment = False
-        best_span = (0, 0)
-        best_len = 0
-        start_idx = 0
-        for idx, flag in enumerate(gate_mask):
-            if flag and not in_segment:
-                in_segment = True
-                start_idx = idx
-            elif not flag and in_segment:
-                in_segment = False
-                span_len = idx - start_idx
-                if span_len > best_len:
-                    best_len = span_len
-                    best_span = (start_idx, idx)
-        if in_segment:
-            span_len = gate_mask.size - start_idx
-            if span_len > best_len:
-                best_span = (start_idx, gate_mask.size)
-                best_len = span_len
-        if best_len > 0:
-            new_gate = np.zeros_like(gate_mask)
-            new_gate[best_span[0] : best_span[1]] = True
-            gate_mask = new_gate
-    else:
-        gate_mask = np.zeros_like(gate_mask, dtype=bool)
+    # Build boolean masks combining supplied gate and optional bounds
+    search_mask = gate_mask.astype(bool, copy=True)
     
-    # Apply optional search bounds
     if search_bounds is not None:
         start = max(0, search_bounds[0])
         end = min(M.size, search_bounds[1])
@@ -189,31 +240,33 @@ def find_minn_peak(
             start, end = 0, M.size
         bounds_mask = np.zeros_like(metric, dtype=bool)
         bounds_mask[start:end] = True
-        gate_mask &= bounds_mask
+        search_mask &= bounds_mask
     
-    if not np.any(gate_mask):
-        # Fall back to the global maximum if the threshold doesn't produce a gate
-        peak_idx = int(np.argmax(Ms))
-        gate_mask = np.zeros_like(gate_mask, dtype=bool)
-        gate_mask[peak_idx] = True
-        return peak_idx, gate_mask, Ms
+    if not np.any(search_mask):
+        raise ValueError("Minn peak detector received empty gate region")
     
-    candidate_idx = np.flatnonzero(gate_mask)
-    peak_rel = int(np.argmax(Ms[candidate_idx]))
-    peak_idx = int(candidate_idx[peak_rel])
-    return peak_idx, gate_mask, Ms
+    # Smooth using trailing average to keep streaming behavior (no future look-ahead)
+    w = max(1, smooth_win)
+    Ms = _trailing_average(np.maximum(metric, 0.0), win=w)
+    
+    peak = _streaming_peak_detector(
+        Ms,
+        gate_mask=search_mask,
+    )
+    if peak is not None:
+        return peak
+    
+    raise RuntimeError("Streaming peak detector did not produce a peak")
 
 
 # Detector and channel parameters (script-local)
 SNR_DB = 10.0
 CFO_HZ = 1000.0
 SMOOTH_WIN = 16  # samples for smoothing M(d) before peak detection
-
-# Minn-only gating parameters
-MINN_GATE_THRESHOLD = 0.5  # fixed fraction of the Minn peak used for gating
+SC_GATE_THRESHOLD = 0.6  # normalized S&C metric threshold for gate
 
 # Base output directory
-PLOTS_BASE_DIR = Path("plots") / "minn"
+PLOTS_BASE_DIR = Path("plots") / "combined_sc_minn"
 
 
 def run_simulation(channel_name: str | None, plots_subdir: str):
@@ -276,23 +329,49 @@ def run_simulation(channel_name: str | None, plots_subdir: str):
     # Apply CFO to simulate LO mismatch at the receiver
     rx_samples = apply_cfo(rx_samples, CFO_HZ, SAMPLE_RATE_HZ)
     
-    # Detection metrics (Minn only)
+    # Detection metrics (Minn + Schmidl & Cox)
     M, P_sum, R_sum = minn_streaming_metric(rx_samples)
-    peak_position, minn_gate_mask, M_smooth = find_minn_peak(
+    M_sc, P_sc, R_sc = schmidl_cox_streaming_metric(rx_samples)
+    
+    sc_gate_mask: np.ndarray | None = None
+    sc_gate_span: tuple[int, int] | None = None
+    sc_norm: np.ndarray | None = None
+    if M_sc.size > 0:
+        max_sc = float(np.max(M_sc))
+        if max_sc > 0:
+            sc_norm = M_sc / max_sc
+            sc_gate_mask = sc_norm >= SC_GATE_THRESHOLD
+        else:
+            sc_gate_mask = M_sc >= SC_GATE_THRESHOLD
+        if sc_gate_mask is not None and not np.any(sc_gate_mask):
+            # Guarantee a valid gate by seeding it with the strongest S&C sample.
+            gate_idx = int(np.argmax(M_sc))
+            sc_gate_mask = np.zeros_like(sc_gate_mask, dtype=bool)
+            sc_gate_mask[gate_idx] = True
+        if sc_gate_mask is not None and np.any(sc_gate_mask):
+            first_idx = int(np.argmax(sc_gate_mask))
+            last_idx = int(sc_gate_mask.size - np.argmax(sc_gate_mask[::-1]) - 1)
+            sc_gate_span = (first_idx, last_idx + 1)
+
+    if sc_gate_mask is None:
+        raise RuntimeError("Schmidl & Cox gate is required for Minn detector")
+
+    peak_position = find_minn_peak(
         M,
         smooth_win=SMOOTH_WIN,
-        gate_threshold=MINN_GATE_THRESHOLD,
+        gate_mask=sc_gate_mask,
         search_bounds=None,
     )
     
     # The Minn peak aligns to the start of the N-length symbol (CP end)
     detected_start = peak_position
     
-    minn_gate_segments = mask_segments(minn_gate_mask)
-    max_m = float(np.max(M)) if M.size > 0 else 0.0
-    minn_norm: np.ndarray | None = M / max_m if max_m > 0 else None
-    max_ms = float(np.max(M_smooth)) if M_smooth.size > 0 else 0.0
-    minn_smooth_norm: np.ndarray | None = M_smooth / max_ms if max_ms > 0 else None
+    minn_norm: np.ndarray | None = None
+    max_m = 0.0
+    if M.size > 0:
+        max_m = float(np.max(M))
+        if max_m > 0:
+            minn_norm = M / max_m
     
     # Ground-truth alignment helpers
     channel_peak_offset = compute_channel_peak_offset(channel_impulse_response)
@@ -312,24 +391,29 @@ def run_simulation(channel_name: str | None, plots_subdir: str):
     channel_desc = f"Measured CIR '{channel_name}'" if channel_name else "Flat AWGN"
     
     plt.figure(figsize=(10, 4))
+    if sc_norm is not None:
+        plt.plot(sc_norm, label="S&C M(d) (norm)", color="tab:blue", linestyle="-")
+        if sc_gate_mask is not None and np.any(sc_gate_mask):
+            for idx, (seg_start, seg_end) in enumerate(mask_segments(sc_gate_mask)):
+                gate_label = f"S&C gate (≥{SC_GATE_THRESHOLD:.0%})" if idx == 0 else None
+                plt.axvspan(seg_start, seg_end, color="tab:blue", alpha=0.15, label=gate_label)
+    elif M_sc.size > 0:
+        plt.plot(M_sc, label="S&C M(d)", color="tab:blue", linestyle="-")
+        if sc_gate_mask is not None and np.any(sc_gate_mask):
+            for idx, (seg_start, seg_end) in enumerate(mask_segments(sc_gate_mask)):
+                gate_label = f"S&C gate (≥{SC_GATE_THRESHOLD:.0%})" if idx == 0 else None
+                plt.axvspan(seg_start, seg_end, color="tab:blue", alpha=0.15, label=gate_label)
     if minn_norm is not None:
         plt.plot(minn_norm, label="Minn M(d) (norm)", color="tab:orange")
     else:
         plt.plot(M, label="Minn M(d)", color="tab:orange")
-    if minn_smooth_norm is not None:
-        plt.plot(minn_smooth_norm, label="Minn M_s(d) (norm, smoothed)", color="tab:orange", linestyle="--")
-    for idx, (seg_start, seg_end) in enumerate(minn_gate_segments):
-        gate_label = (
-            f"Minn gate (≥{MINN_GATE_THRESHOLD:.0%} of Minn peak)" if idx == 0 else None
-        )
-        plt.axvspan(seg_start, seg_end, color="tab:orange", alpha=0.15, label=gate_label)
     plt.axvline(peak_position, color="tab:red", linestyle=":", label=f"Minn peak @ {peak_position}")
     plt.axvline(expected_n_start, color="tab:green", linestyle="--", label="Expected N start")
     plt.xlabel("Sample index d")
-    plt.ylabel("Normalized M(d)" if minn_norm is not None else "M(d)")
-    plt.title(f"Minn Metric & Gate — {channel_desc}")
+    plt.ylabel("Normalized M(d)" if minn_norm is not None or sc_norm is not None else "M(d)")
+    plt.title(f"Streaming Metrics (Minn & S&C) — {channel_desc}")
     plt.legend(loc="upper right")
-    if minn_norm is not None:
+    if minn_norm is not None or sc_norm is not None:
         plt.ylim(-0.05, 1.05)
     plt.tight_layout()
     plt.savefig(metric_plot_path, dpi=150)
@@ -342,9 +426,10 @@ def run_simulation(channel_name: str | None, plots_subdir: str):
     if rx_samples.ndim > 1 and rx_samples.shape[0] > 1:
         for idx, branch in enumerate(rx_samples):
             axes[0].plot(np.abs(branch), alpha=0.3, linewidth=0.8)
-    for idx, (seg_start, seg_end) in enumerate(minn_gate_segments):
-        gate_label = "Minn gate" if idx == 0 else None
-        axes[0].axvspan(seg_start, seg_end, color="tab:orange", alpha=0.18, label=gate_label)
+    if sc_gate_mask is not None and np.any(sc_gate_mask):
+        for idx, (seg_start, seg_end) in enumerate(mask_segments(sc_gate_mask)):
+            gate_label = "S&C gate" if idx == 0 else None
+            axes[0].axvspan(seg_start, seg_end, color="tab:blue", alpha=0.2, label=gate_label)
     axes[0].axvline(true_cp_start, color="tab:purple", linestyle="--", label="CP start (true)")
     axes[0].axvline(expected_n_start, color="tab:green", linestyle="--", label="N start (exp)")
     axes[0].axvline(detected_start, color="tab:red", linestyle=":", label="Detected start")
@@ -352,24 +437,25 @@ def run_simulation(channel_name: str | None, plots_subdir: str):
     axes[0].set_title(f"Received Magnitude and Detected Start (Minn, {channel_desc})")
     axes[0].legend(loc="upper right")
     
+    if sc_norm is not None:
+        axes[1].plot(sc_norm, label="S&C M(d) (norm)", color="tab:blue")
+        if sc_gate_mask is not None and np.any(sc_gate_mask):
+            for seg_start, seg_end in mask_segments(sc_gate_mask):
+                axes[1].axvspan(seg_start, seg_end, color="tab:blue", alpha=0.12)
+    elif M_sc.size > 0:
+        axes[1].plot(M_sc, label="S&C M(d)", color="tab:blue")
+        if sc_gate_mask is not None and np.any(sc_gate_mask):
+            for seg_start, seg_end in mask_segments(sc_gate_mask):
+                axes[1].axvspan(seg_start, seg_end, color="tab:blue", alpha=0.12)
     if minn_norm is not None:
         axes[1].plot(minn_norm, label="Minn M(d) (norm)", color="tab:orange")
     else:
         axes[1].plot(M, label="Minn M(d)", color="tab:orange")
-    if minn_smooth_norm is not None:
-        axes[1].plot(
-            minn_smooth_norm,
-            label="Minn M_s(d) (norm, smoothed)",
-            color="tab:orange",
-            linestyle="--",
-        )
-    for seg_start, seg_end in minn_gate_segments:
-        axes[1].axvspan(seg_start, seg_end, color="tab:orange", alpha=0.12)
     axes[1].axvline(peak_position, color="tab:red", linestyle=":", label=f"Minn peak @ {peak_position}")
     axes[1].axvline(expected_n_start, color="tab:green", linestyle="--", label="Expected N start")
     axes[1].set_xlabel("Sample index d")
-    axes[1].set_ylabel("Normalized M(d)" if minn_norm is not None else "M(d)")
-    axes[1].set_title("Timing Metrics (Minn)")
+    axes[1].set_ylabel("Normalized M(d)" if minn_norm is not None or sc_norm is not None else "M(d)")
+    axes[1].set_title("Timing Metrics (Minn & S&C)")
     if minn_norm is not None or sc_norm is not None:
         axes[1].set_ylim(-0.05, 1.05)
     axes[1].legend(loc="upper right")
@@ -434,15 +520,15 @@ def run_simulation(channel_name: str | None, plots_subdir: str):
     print(f"  Detected Minn peak at d={peak_position}")
     print(f"  Expected N start at d={expected_n_start}")
     print(f"  Timing error: {timing_error} samples ({abs(timing_error)/N_FFT*100:.1f}% of symbol)")
-    if minn_gate_segments:
-        gate_start = minn_gate_segments[0][0]
-        gate_end = minn_gate_segments[-1][1]
+    if sc_gate_span is not None:
+        gate_start, gate_end = sc_gate_span
         print(
-            f"  Minn gate window: [{gate_start}, {gate_end}) "
-            f"(threshold ≥{MINN_GATE_THRESHOLD:.0%} of Minn peak, span {gate_end - gate_start} samples)",
+            f"  S&C gate window: [{gate_start}, {gate_end}) (norm ≥ {SC_GATE_THRESHOLD:.0%}, span {gate_end - gate_start} samples)",
         )
-    else:
-        print("  Minn gate not triggered (metric never exceeded threshold)")
+    elif sc_gate_mask is not None:
+        print(
+            f"  S&C gate not triggered (no samples reached threshold {SC_GATE_THRESHOLD:.0%})",
+        )
     print(f"\nCarrier Frequency Offset:")
     print(f"  Applied CFO: {CFO_HZ} Hz")
     print(f"  Estimated CFO from CP: {cfo_est_hz:.2f} Hz")
