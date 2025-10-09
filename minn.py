@@ -289,11 +289,6 @@ def run_simulation(channel_name: str | None, plots_subdir: str):
     detected_start = peak_position
     
     minn_gate_segments = mask_segments(minn_gate_mask)
-    max_m = float(np.max(M)) if M.size > 0 else 0.0
-    minn_norm: np.ndarray | None = M / max_m if max_m > 0 else None
-    max_ms = float(np.max(M_smooth)) if M_smooth.size > 0 else 0.0
-    minn_smooth_norm: np.ndarray | None = M_smooth / max_ms if max_ms > 0 else None
-    
     # Ground-truth alignment helpers
     channel_peak_offset = compute_channel_peak_offset(channel_impulse_response)
     # Plot raw CIR if measured profile enabled
@@ -312,12 +307,8 @@ def run_simulation(channel_name: str | None, plots_subdir: str):
     channel_desc = f"Measured CIR '{channel_name}'" if channel_name else "Flat AWGN"
     
     plt.figure(figsize=(10, 4))
-    if minn_norm is not None:
-        plt.plot(minn_norm, label="Minn M(d) (norm)", color="tab:orange")
-    else:
-        plt.plot(M, label="Minn M(d)", color="tab:orange")
-    if minn_smooth_norm is not None:
-        plt.plot(minn_smooth_norm, label="Minn M_s(d) (norm, smoothed)", color="tab:orange", linestyle="--")
+    plt.plot(M, label="Minn M(d)", color="tab:orange")
+    plt.plot(M_smooth, label="Minn M_s(d) (smoothed)", color="tab:orange", linestyle="--")
     for idx, (seg_start, seg_end) in enumerate(minn_gate_segments):
         gate_label = (
             f"Minn gate (≥{MINN_GATE_THRESHOLD:.0%} of Minn peak)" if idx == 0 else None
@@ -326,11 +317,9 @@ def run_simulation(channel_name: str | None, plots_subdir: str):
     plt.axvline(peak_position, color="tab:red", linestyle=":", label=f"Minn peak @ {peak_position}")
     plt.axvline(expected_n_start, color="tab:green", linestyle="--", label="Expected N start")
     plt.xlabel("Sample index d")
-    plt.ylabel("Normalized M(d)" if minn_norm is not None else "M(d)")
+    plt.ylabel("M(d)")
     plt.title(f"Minn Metric & Gate — {channel_desc}")
     plt.legend(loc="upper right")
-    if minn_norm is not None:
-        plt.ylim(-0.05, 1.05)
     plt.tight_layout()
     plt.savefig(metric_plot_path, dpi=150)
     plt.close()
@@ -352,26 +341,20 @@ def run_simulation(channel_name: str | None, plots_subdir: str):
     axes[0].set_title(f"Received Magnitude and Detected Start (Minn, {channel_desc})")
     axes[0].legend(loc="upper right")
     
-    if minn_norm is not None:
-        axes[1].plot(minn_norm, label="Minn M(d) (norm)", color="tab:orange")
-    else:
-        axes[1].plot(M, label="Minn M(d)", color="tab:orange")
-    if minn_smooth_norm is not None:
-        axes[1].plot(
-            minn_smooth_norm,
-            label="Minn M_s(d) (norm, smoothed)",
-            color="tab:orange",
-            linestyle="--",
-        )
+    axes[1].plot(M, label="Minn M(d)", color="tab:orange")
+    axes[1].plot(
+        M_smooth,
+        label="Minn M_s(d) (smoothed)",
+        color="tab:orange",
+        linestyle="--",
+    )
     for seg_start, seg_end in minn_gate_segments:
         axes[1].axvspan(seg_start, seg_end, color="tab:orange", alpha=0.12)
     axes[1].axvline(peak_position, color="tab:red", linestyle=":", label=f"Minn peak @ {peak_position}")
     axes[1].axvline(expected_n_start, color="tab:green", linestyle="--", label="Expected N start")
     axes[1].set_xlabel("Sample index d")
-    axes[1].set_ylabel("Normalized M(d)" if minn_norm is not None else "M(d)")
+    axes[1].set_ylabel("M(d)")
     axes[1].set_title("Timing Metrics (Minn)")
-    if minn_norm is not None or sc_norm is not None:
-        axes[1].set_ylim(-0.05, 1.05)
     axes[1].legend(loc="upper right")
     
     fig.tight_layout()
