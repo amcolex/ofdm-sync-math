@@ -18,6 +18,7 @@ from core import (
     ofdm_fft_used,
     ls_channel_estimate,
     equalize,
+    align_complex_gain,
     evm_rms_db,
     plot_constellation,
     SAMPLE_RATE_HZ,
@@ -204,6 +205,86 @@ def find_minn_peak(
     return peak_idx, gate_mask, Ms
 
 
+def _reconstruct_cir_from_ls(h_used: np.ndarray) -> np.ndarray:
+    """Rebuild a time-domain CIR from a per-subcarrier LS channel estimate."""
+    spectrum = np.zeros(N_FFT, dtype=np.complex128)
+    h_used = np.asarray(h_used, dtype=np.complex128)
+    if h_used.size == 0:
+        return spectrum
+    idx = centered_subcarrier_indices(NUM_ACTIVE_SUBCARRIERS)
+    dc = N_FFT // 2
+    placement = (dc + idx) % N_FFT
+    spectrum[placement] = h_used
+    cir = np.fft.ifft(np.fft.ifftshift(spectrum))
+    return cir
+
+
+def _plot_ls_cir(
+    ls_cir: np.ndarray,
+    channel_impulse_response: np.ndarray | None,
+    channel_peak_offset: int,
+    timing_error: int,
+    path: Path,
+    channel_desc: str,
+) -> None:
+    """Plot the magnitude of the LS-derived CIR alongside the measured CIR."""
+    taps = np.arange(ls_cir.size)
+    ls_mag = np.abs(ls_cir)
+    ls_peak_idx = int(np.argmax(ls_mag))
+
+    fig, ax = plt.subplots(figsize=(10, 4))
+    ax.plot(taps, ls_mag, label="LS CIR |h|", color="tab:blue")
+    ax.axvline(ls_peak_idx, color="tab:red", linestyle=":", label=f"LS peak @ {ls_peak_idx}")
+
+    note_lines = [f"Timing error: {timing_error} samples"]
+    if channel_impulse_response is not None:
+        cir = np.asarray(channel_impulse_response, dtype=np.complex128)
+        if cir.ndim == 1:
+            cir = cir[np.newaxis, :]
+        agg_mag = np.sqrt(np.sum(np.abs(cir) ** 2, axis=0))
+        ax.plot(
+            np.arange(agg_mag.size),
+            agg_mag,
+            label="Measured CIR |h|",
+            color="tab:green",
+            alpha=0.7,
+        )
+        ax.axvline(
+            channel_peak_offset,
+            color="tab:olive",
+            linestyle="--",
+            label=f"Measured peak @ {channel_peak_offset}",
+        )
+        peak_diff = ls_peak_idx - channel_peak_offset
+        n = ls_cir.size
+        if peak_diff > n // 2:
+            peak_diff -= n
+        elif peak_diff < -n // 2:
+            peak_diff += n
+        note_lines.append(f"Peak shift vs measured: {peak_diff} taps")
+    else:
+        note_lines.append(f"LS peak index: {ls_peak_idx}")
+
+    ax.text(
+        0.02,
+        0.95,
+        "\n".join(note_lines),
+        transform=ax.transAxes,
+        ha="left",
+        va="top",
+        fontsize=9,
+        bbox=dict(boxstyle="round,pad=0.3", fc="white", alpha=0.6),
+    )
+    ax.set_xlabel("Tap index")
+    ax.set_ylabel("Magnitude")
+    ax.set_title(f"LS-Derived CIR (Minn, {channel_desc})")
+    ax.grid(True, alpha=0.3)
+    ax.legend(loc="upper right")
+    fig.tight_layout()
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+
+
 # Detector and channel parameters (script-local)
 SNR_DB = 10.0
 CFO_HZ = 1000.0
@@ -248,6 +329,7 @@ def run_simulation(channel_name: str | None, plots_subdir: str):
     rx_plot_path = plots_dir / "rx_frame_time.png"
     results_plot_path = plots_dir / "start_detection.png"
     cir_plot_path = plots_dir / "channel_cir.png"
+    ls_cir_plot_path = plots_dir / "ls_cir.png"
     const_plot_path = plots_dir / "constellation.png"
     sto_plot_path = plots_dir / "phase_slope_sto.png"
     
@@ -303,7 +385,8 @@ def run_simulation(channel_name: str | None, plots_subdir: str):
     # Expected timing: CP start + CP length = start of N samples
     true_cp_start = TX_PRE_PAD_SAMPLES + channel_peak_offset
     expected_n_start = true_cp_start + CYCLIC_PREFIX
-    
+    timing_error = detected_start - expected_n_start
+
     # Plots
     channel_desc = f"Measured CIR '{channel_name}'" if channel_name else "Flat AWGN"
     
@@ -399,13 +482,27 @@ def run_simulation(channel_name: str | None, plots_subdir: str):
     data_td = rx_eff[data_cp_start + CYCLIC_PREFIX : data_cp_start + CYCLIC_PREFIX + N_FFT]
     y_data_used = ofdm_fft_used(data_td)
     xhat = equalize(y_data_used, h_est)
-    from core import align_complex_gain
     xhat_aligned, gain = align_complex_gain(xhat, data_used)
     evm_rms, evm_db = evm_rms_db(xhat_aligned, data_used)
-    plot_constellation(xhat_aligned, data_used, const_plot_path, f"Equalized Data Constellation (Minn, {channel_desc})")
+    plot_constellation(
+        xhat_aligned,
+        data_used,
+        const_plot_path,
+        f"Equalized Data Constellation (Minn, {channel_desc})",
+    )
+
+    # LS-derived CIR visualization (captures residual timing offset)
+    ls_cir = _reconstruct_cir_from_ls(h_est)
+    _plot_ls_cir(
+        ls_cir,
+        channel_impulse_response,
+        channel_peak_offset,
+        timing_error,
+        ls_cir_plot_path,
+        channel_desc,
+    )
     
     # Prints
-    timing_error = detected_start - expected_n_start
     print(f"\n{'='*70}")
     print(f"MINN SYNCHRONIZATION RESULTS - {channel_desc.upper()}")
     print(f"{'='*70}")
@@ -446,6 +543,7 @@ def run_simulation(channel_name: str | None, plots_subdir: str):
     print(f"  - constellation.png")
     print(f"  - tx_frame_time.png")
     print(f"  - rx_frame_time.png")
+    print(f"  - ls_cir.png")
     print(f"  - phase_slope_sto.png")
     if channel_impulse_response is not None:
         print(f"  - channel_cir.png")
