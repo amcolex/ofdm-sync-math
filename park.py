@@ -21,8 +21,8 @@ from core import (
     plot_constellation,
     SAMPLE_RATE_HZ,
     apply_cfo,
-    estimate_timing_offset_from_phase_slope,
     align_complex_gain,
+    plot_phase_slope_diagnostics,
 )
 
 
@@ -133,6 +133,7 @@ def run_simulation(channel_name: str | None, plots_subdir: str) -> None:
     detection_plot_path = plots_dir / "start_detection.png"
     cir_plot_path = plots_dir / "channel_cir.png"
     const_plot_path = plots_dir / "constellation.png"
+    sto_plot_path = plots_dir / "phase_slope_sto.png"
 
     park_preamble = build_park_preamble(rng, include_cp=True)
     pilot_symbol, pilot_used = build_random_qpsk_symbol(rng, include_cp=True)
@@ -259,7 +260,12 @@ def run_simulation(channel_name: str | None, plots_subdir: str) -> None:
     ]
     y_pilot_used = ofdm_fft_used(pilot_td)
     h_est = ls_channel_estimate(y_pilot_used, pilot_used)
-    slope_rad_per_bin, timing_offset_samples = estimate_timing_offset_from_phase_slope(h_est)
+    sto_title = f"Residual Timing From Phase Slope (Park, {channel_desc})"
+    slope_rad_per_bin, timing_offset_samples = plot_phase_slope_diagnostics(
+        h_est,
+        sto_plot_path,
+        sto_title,
+    )
 
     data_cp_start = pilot_cp_start_est + CYCLIC_PREFIX + N_FFT
     max_data_start = rx_eff.shape[-1] - (N_FFT + CYCLIC_PREFIX)
@@ -314,6 +320,7 @@ def run_simulation(channel_name: str | None, plots_subdir: str) -> None:
     print("  - constellation.png")
     print("  - tx_frame_time.png")
     print("  - rx_frame_time.png")
+    print("  - phase_slope_sto.png")
     if channel_impulse_response is not None:
         print("  - channel_cir.png")
     print(f"{'='*70}\n")

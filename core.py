@@ -386,6 +386,57 @@ def plot_constellation(x: np.ndarray, ref: np.ndarray | None, path: Path, title:
     plt.close(fig)
 
 
+def plot_phase_slope_diagnostics(
+    h_used: np.ndarray,
+    path: Path,
+    title: str,
+) -> tuple[float, float]:
+    """Plot unwrapped channel phase vs. subcarrier index with linear fit.
+
+    Returns:
+        slope_rad_per_bin: fitted slope (rad / subcarrier)
+        timing_offset_samples: estimated residual timing offset in samples
+    """
+    h_used = np.asarray(h_used, dtype=np.complex128)
+    if h_used.size == 0:
+        fig, ax = plt.subplots(figsize=(8, 3))
+        ax.text(
+            0.5,
+            0.5,
+            "No active subcarriers to analyze",
+            ha="center",
+            va="center",
+        )
+        ax.axis("off")
+        fig.tight_layout()
+        fig.savefig(path, dpi=150)
+        plt.close(fig)
+        return 0.0, 0.0
+
+    slope_rad_per_bin, timing_offset_samples = estimate_timing_offset_from_phase_slope(h_used)
+
+    k = centered_subcarrier_indices(NUM_ACTIVE_SUBCARRIERS).astype(np.float64)
+    phase = np.unwrap(np.angle(h_used))
+    k_mean = float(np.mean(k))
+    phase_mean = float(np.mean(phase))
+    intercept = phase_mean - slope_rad_per_bin * k_mean
+    fit = slope_rad_per_bin * k + intercept
+
+    fig, ax = plt.subplots(figsize=(8, 4))
+    ax.plot(k, phase, ".", markersize=4, alpha=0.7, label="Measured phase")
+    ax.plot(k, fit, color="tab:red", linewidth=1.5, label="Linear fit")
+    ax.set_xlabel("Subcarrier index (k)")
+    ax.set_ylabel("Phase [rad]")
+    ax.set_title(f"{title}\nSTO ≈ {timing_offset_samples:.2f} samples ({slope_rad_per_bin:.4f} rad/bin)")
+    ax.grid(True, alpha=0.3)
+    ax.legend(loc="upper left")
+    fig.tight_layout()
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+
+    return slope_rad_per_bin, timing_offset_samples
+
+
 # -----------------------------------------------------
 # Timing offset from phase slope across subcarriers
 # -----------------------------------------------------

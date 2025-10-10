@@ -23,7 +23,7 @@ from core import (
     plot_constellation,
     SAMPLE_RATE_HZ,
     apply_cfo,
-    estimate_timing_offset_from_phase_slope,
+    plot_phase_slope_diagnostics,
 )
 
 # ZC-specific parameters
@@ -73,6 +73,7 @@ def run_simulation(channel_name: str | None, plots_subdir: str):
     results_plot_path = plots_dir / "start_detection.png"
     cir_plot_path = plots_dir / "channel_cir.png"
     const_plot_path = plots_dir / "constellation.png"
+    sto_plot_path = plots_dir / "phase_slope_sto.png"
 
     pss_waveform = build_pss_symbol(include_cp=True)
     pilot_symbol, pilot_used = build_random_qpsk_symbol(rng, include_cp=True)
@@ -200,7 +201,12 @@ def run_simulation(channel_name: str | None, plots_subdir: str):
     y_pilot_used = ofdm_fft_used(pilot_td)
     h_est = ls_channel_estimate(y_pilot_used, pilot_used)
     # Estimate residual timing from linear phase slope of H(k)
-    slope_rad_per_bin, timing_offset_samples = estimate_timing_offset_from_phase_slope(h_est)
+    sto_title = f"Residual Timing From Phase Slope (ZC, {channel_desc})"
+    slope_rad_per_bin, timing_offset_samples = plot_phase_slope_diagnostics(
+        h_est,
+        sto_plot_path,
+        sto_title,
+    )
 
     # --- Equalize data symbol and compute EVM ---
     data_td = rx_eff[data_cp_start + CYCLIC_PREFIX : data_cp_start + CYCLIC_PREFIX + N_FFT]
@@ -246,6 +252,7 @@ def run_simulation(channel_name: str | None, plots_subdir: str):
     print(f"  - constellation.png")
     print(f"  - tx_frame_time.png")
     print(f"  - rx_frame_time.png")
+    print(f"  - phase_slope_sto.png")
     if channel_impulse_response is not None:
         print(f"  - channel_cir.png")
     print(f"{'='*70}\n")
