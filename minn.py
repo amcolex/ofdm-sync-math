@@ -286,7 +286,7 @@ def _plot_ls_cir(
 
 
 # Detector and channel parameters (script-local)
-SNR_DB = 10.0
+SNR_DB = 30.0
 CFO_HZ = 1000.0
 SMOOTH_WIN = 16  # samples for smoothing M(d) before peak detection
 
