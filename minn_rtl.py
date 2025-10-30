@@ -347,9 +347,15 @@ def minn_rtl_streaming_metric(
 
 
 @dataclass
+class MinnRTLEvent:
+    peak_index: int
+    detected_index: int
+    gate_segment: tuple[int, int]
+
+
+@dataclass
 class MinnRTLDetection:
-    detected_index: int | None
-    peak_index: int | None
+    events: list[MinnRTLEvent]
     gate_mask: np.ndarray
     gate_segments: list[tuple[int, int]]
 
@@ -367,13 +373,12 @@ def detect_minn_rtl(
     length = corr.size
 
     gate_segments: list[tuple[int, int]] = []
+    events: list[MinnRTLEvent] = []
     gate_open = False
     gate_start: int | None = None
     peak_value = 0.0
     peak_index = 0
     low_counter = 0
-    detected_index: int | None = None
-    detected_peak: int | None = None
     hyst_limit = hysteresis - 1 if hysteresis > 0 else 0
 
     for idx in range(length):
@@ -394,29 +399,30 @@ def detect_minn_rtl(
             if above[idx]:
                 low_counter = 0
             else:
+                closing = False
                 if hysteresis == 0:
-                    if detected_index is None:
-                        detected_index = peak_index + timing_offset
-                        detected_peak = peak_index
-                    gate_open = False
-                    if gate_start is not None:
-                        gate_segments.append((gate_start, idx + 1))
-                        gate_start = None
-                    peak_value = 0.0
-                    low_counter = 0
+                    closing = True
                 else:
                     if low_counter == hyst_limit:
-                        if detected_index is None:
-                            detected_index = peak_index + timing_offset
-                            detected_peak = peak_index
-                        gate_open = False
-                        if gate_start is not None:
-                            gate_segments.append((gate_start, idx + 1))
-                            gate_start = None
-                        peak_value = 0.0
-                        low_counter = 0
+                        closing = True
                     else:
                         low_counter += 1
+                if closing:
+                    detected_index = peak_index + timing_offset
+                    segment_start = gate_start if gate_start is not None else idx
+                    segment = (segment_start, idx + 1)
+                    gate_segments.append(segment)
+                    events.append(
+                        MinnRTLEvent(
+                            peak_index=peak_index,
+                            detected_index=detected_index,
+                            gate_segment=segment,
+                        )
+                    )
+                    gate_open = False
+                    gate_start = None
+                    peak_value = 0.0
+                    low_counter = 0
 
     if gate_open and gate_start is not None:
         gate_segments.append((gate_start, length))
@@ -426,15 +432,14 @@ def detect_minn_rtl(
         gate_mask[start:end] = True
 
     return MinnRTLDetection(
-        detected_index=detected_index,
-        peak_index=detected_peak,
+        events=events,
         gate_mask=gate_mask,
         gate_segments=gate_segments,
     )
 
 
 # Detector and channel parameters
-SNR_DB = 30.0
+SNR_DB = 0.0
 CFO_HZ = 1000.0
 SMOOTH_SHIFT = 3
 THRESH_FRAC_BITS = 15
@@ -481,7 +486,11 @@ def run_simulation(channel_name: str | None, plots_subdir: str) -> None:
     pilot_symbol, pilot_used = build_random_qpsk_symbol(rng, include_cp=True)
     data_symbol, data_used = build_random_qpsk_symbol(rng, include_cp=True)
     frame = np.concatenate((minn_preamble, pilot_symbol, data_symbol))
-    tx_samples = np.concatenate((np.zeros(TX_PRE_PAD_SAMPLES, dtype=complex), frame))
+    frame_len = frame.size
+    inter_guard = np.zeros(frame_len, dtype=complex)
+    leading_guard = np.zeros(TX_PRE_PAD_SAMPLES, dtype=complex)
+    tx_samples = np.concatenate((leading_guard, frame, inter_guard, frame))
+    frame_starts = [leading_guard.size, leading_guard.size + frame_len + inter_guard.size]
 
     if channel_name is None:
         channel_impulse_response = None
@@ -512,10 +521,13 @@ def run_simulation(channel_name: str | None, plots_subdir: str) -> None:
         timing_offset=TIMING_OFFSET,
     )
 
-    if detection.detected_index is not None:
-        detected_start = int(detection.detected_index)
-        peak_position = int(detection.peak_index if detection.peak_index is not None else detected_start)
+    events = detection.events
+    if events:
+        primary_event = events[0]
+        detected_start = int(primary_event.detected_index)
+        peak_position = int(primary_event.peak_index)
     else:
+        primary_event = None
         peak_position = int(np.argmax(metric_state.smooth_metric))
         detected_start = peak_position + TIMING_OFFSET
 
@@ -530,9 +542,22 @@ def run_simulation(channel_name: str | None, plots_subdir: str) -> None:
             cir_plot_path,
         )
 
-    true_cp_start = TX_PRE_PAD_SAMPLES + channel_peak_offset
-    expected_n_start = true_cp_start + CYCLIC_PREFIX
-    timing_error = detected_start - expected_n_start
+    true_cp_starts = [start + channel_peak_offset for start in frame_starts]
+    expected_n_starts = [cp_start + CYCLIC_PREFIX for cp_start in true_cp_starts]
+    if expected_n_starts:
+        primary_expected = expected_n_starts[0]
+        timing_error = detected_start - primary_expected
+    else:
+        primary_expected = 0
+        timing_error = detected_start
+    peak_lines = [evt.peak_index for evt in events] if events else [peak_position]
+    detected_lines = [evt.detected_index for evt in events] if events else [detected_start]
+    per_event_errors: list[int | None] = []
+    for idx, evt in enumerate(events):
+        if idx < len(expected_n_starts):
+            per_event_errors.append(evt.detected_index - expected_n_starts[idx])
+        else:
+            per_event_errors.append(None)
 
     channel_desc = f"Measured CIR '{channel_name}'" if channel_name else "Flat AWGN"
 
@@ -548,8 +573,12 @@ def run_simulation(channel_name: str | None, plots_subdir: str) -> None:
     for idx, (start, end) in enumerate(gate_segments):
         gate_label = "Gate window" if idx == 0 else None
         plt.axvspan(start, end, color="tab:orange", alpha=0.15, label=gate_label)
-    plt.axvline(peak_position, color="tab:red", linestyle=":", label=f"Peak @ {peak_position}")
-    plt.axvline(expected_n_start, color="tab:green", linestyle="--", label="Expected N start")
+    for idx, peak in enumerate(peak_lines):
+        peak_label = "Detected peak" if idx == 0 else None
+        plt.axvline(peak, color="tab:red", linestyle=":", label=peak_label)
+    for idx, expected in enumerate(expected_n_starts):
+        exp_label = "Expected N start" if idx == 0 else None
+        plt.axvline(expected, color="tab:green", linestyle="--", label=exp_label)
     plt.xlabel("Sample index d")
     plt.ylabel("Metric")
     plt.title(f"Minn RTL Metric & Gate - {channel_desc}")
@@ -568,9 +597,15 @@ def run_simulation(channel_name: str | None, plots_subdir: str) -> None:
     for seg_idx, (start, end) in enumerate(gate_segments):
         gate_label = "Gate window" if seg_idx == 0 else None
         axes[0].axvspan(start, end, color="tab:orange", alpha=0.18, label=gate_label)
-    axes[0].axvline(true_cp_start, color="tab:purple", linestyle="--", label="CP start (true)")
-    axes[0].axvline(expected_n_start, color="tab:green", linestyle="--", label="N start (exp)")
-    axes[0].axvline(detected_start, color="tab:red", linestyle=":", label="Detected start")
+    for idx, cp_start in enumerate(true_cp_starts):
+        cp_label = "CP start (true)" if idx == 0 else None
+        axes[0].axvline(cp_start, color="tab:purple", linestyle="--", label=cp_label)
+    for idx, expected in enumerate(expected_n_starts):
+        exp_label = "N start (exp)" if idx == 0 else None
+        axes[0].axvline(expected, color="tab:green", linestyle="--", label=exp_label)
+    for idx, det in enumerate(detected_lines):
+        det_label = "Detected start" if idx == 0 else None
+        axes[0].axvline(det, color="tab:red", linestyle=":", label=det_label)
     axes[0].set_ylabel("Magnitude")
     axes[0].set_title(f"Received Magnitude and Detected Start (Minn RTL, {channel_desc})")
     axes[0].legend(loc="upper right")
@@ -585,8 +620,12 @@ def run_simulation(channel_name: str | None, plots_subdir: str) -> None:
     axes[1].plot(thresh_trace, label="Threshold (scaled)", color="tab:green", linestyle=":")
     for start, end in gate_segments:
         axes[1].axvspan(start, end, color="tab:orange", alpha=0.12)
-    axes[1].axvline(peak_position, color="tab:red", linestyle=":", label=f"Peak @ {peak_position}")
-    axes[1].axvline(expected_n_start, color="tab:green", linestyle="--", label="Expected N start")
+    for idx, peak in enumerate(peak_lines):
+        peak_label = "Detected peak" if idx == 0 else None
+        axes[1].axvline(peak, color="tab:red", linestyle=":", label=peak_label)
+    for idx, expected in enumerate(expected_n_starts):
+        exp_label = "Expected N start" if idx == 0 else None
+        axes[1].axvline(expected, color="tab:green", linestyle="--", label=exp_label)
     axes[1].set_xlabel("Sample index d")
     axes[1].set_ylabel("Metric")
     axes[1].set_title("Timing Metrics (Minn RTL)")
@@ -596,7 +635,7 @@ def run_simulation(channel_name: str | None, plots_subdir: str) -> None:
     fig.savefig(results_plot_path, dpi=150)
     plt.close(fig)
 
-    plot_time_series(tx_samples, "Transmit Frame (with Leading Zeros)", tx_plot_path)
+    plot_time_series(tx_samples, "Transmit Frame (two Minn frames with guard)", tx_plot_path)
     plot_time_series(rx_samples, f"Received Frame After Channel ({channel_desc})", rx_plot_path)
 
     preamble_n_start_est = detected_start
@@ -657,20 +696,39 @@ def run_simulation(channel_name: str | None, plots_subdir: str) -> None:
         )
     else:
         print("Channel profile: Flat AWGN (no multipath)")
-    print(f"\nTiming Detection:")
-    print(f"  Detected peak at d={peak_position}")
-    print(f"  Detected start after timing offset: d={detected_start}")
-    print(f"  Expected N start at d={expected_n_start}")
-    print(f"  Timing error: {timing_error} samples ({abs(timing_error)/N_FFT*100:.1f}% of symbol)")
-    if gate_segments:
-        gate_start, gate_end = gate_segments[0][0], gate_segments[-1][1]
-        frac = THRESH_VALUE / float(1 << THRESH_FRAC_BITS)
-        print(
-            f"  RTL gate window: [{gate_start}, {gate_end}) "
-            f"(threshold >={frac:.1%} of energy proxy, span {gate_end - gate_start} samples)",
-        )
+    print(f"\nTiming Detections:")
+    if events:
+        print(f"  Detected {len(events)} event(s)")
+        for idx, evt in enumerate(events):
+            expected = expected_n_starts[idx] if idx < len(expected_n_starts) else None
+            err = per_event_errors[idx] if idx < len(per_event_errors) else None
+            if expected is not None and err is not None:
+                print(
+                    f"    Event {idx}: peak={evt.peak_index} detected={evt.detected_index} "
+                    f"expected={expected} error={err} samples"
+                )
+            else:
+                print(
+                    f"    Event {idx}: peak={evt.peak_index} detected={evt.detected_index} "
+                    "(no expected reference)"
+                )
     else:
-        print("  RTL gate not triggered (metric never exceeded threshold)")
+        print(f"  No detection events; fallback peak at d={peak_position}")
+    frac = THRESH_VALUE / float(1 << THRESH_FRAC_BITS)
+    if gate_segments:
+        for idx, (start, end) in enumerate(gate_segments):
+            print(
+                f"  Gate {idx}: [{start}, {end}) threshold >={frac:.1%} span {end - start} samples"
+            )
+    else:
+        print("  No gate segments recorded (metric never exceeded threshold)")
+    if events:
+        print("  Event 0 is used for CFO/channel processing.")
+    print(f"  Frame length: {frame_len} samples, guard length: {inter_guard.size} samples")
+    print(
+        f"  Primary timing error: {timing_error} samples "
+        f"({abs(timing_error)/N_FFT*100:.1f}% of symbol)"
+    )
     print(f"\nCarrier Frequency Offset:")
     print(f"  Applied CFO: {CFO_HZ} Hz")
     print(f"  Estimated CFO from CP: {cfo_est_hz:.2f} Hz")
