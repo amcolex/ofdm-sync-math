@@ -286,7 +286,7 @@ def _plot_ls_cir(
 
 
 # Detector and channel parameters (script-local)
-SNR_DB = 30.0
+SNR_DB = 0.0
 CFO_HZ = 1000.0
 SMOOTH_WIN = 16  # samples for smoothing M(d) before peak detection
 
@@ -390,6 +390,31 @@ def run_simulation(channel_name: str | None, plots_subdir: str):
     # Plots
     channel_desc = f"Measured CIR '{channel_name}'" if channel_name else "Flat AWGN"
     
+    # Energy-based threshold calculation
+    # The Minn metric M = |P|²/R² is already normalized
+    # For a fair comparison, compute raw correlation |P|² and threshold = k * R²
+    P_real_clipped = np.clip(P_sum.real, 0, None)
+    corr_raw = P_real_clipped ** 2  # Unnormalized correlation (like RTL)
+    
+    # Energy-based threshold: thresh = k * R² where k is a fraction
+    THRESH_FRAC = 0.10  # 10% of energy squared
+    energy_thresh = THRESH_FRAC * (R_sum ** 2)
+    
+    # Compute metric/threshold ratio at peak
+    peak_corr = corr_raw[peak_position] if peak_position < len(corr_raw) else 0
+    peak_thresh = energy_thresh[peak_position] if peak_position < len(energy_thresh) else 1
+    peak_ratio = peak_corr / peak_thresh if peak_thresh > 0 else 0
+    
+    # Find sidelobe max (excluding main peak region)
+    peak_region = range(max(0, peak_position - 300), min(len(corr_raw), peak_position + 300))
+    mask = np.ones(len(corr_raw), dtype=bool)
+    mask[list(peak_region)] = False
+    mask[:TX_PRE_PAD_SAMPLES] = False  # Exclude leading guard
+    sidelobe_vals = corr_raw[mask]
+    sidelobe_max = float(np.max(sidelobe_vals)) if sidelobe_vals.size > 0 else 0
+    sidelobe_ratio = sidelobe_max / peak_thresh if peak_thresh > 0 else 0
+    
+    # Plot 1: Normalized Minn metric (original)
     plt.figure(figsize=(10, 4))
     plt.plot(M, label="Minn M(d)", color="tab:orange")
     plt.plot(M_smooth, label="Minn M_s(d) (smoothed)", color="tab:orange", linestyle="--")
@@ -408,22 +433,73 @@ def run_simulation(channel_name: str | None, plots_subdir: str):
     plt.savefig(metric_plot_path, dpi=150)
     plt.close()
     
-    fig, axes = plt.subplots(2, 1, figsize=(10, 6), sharex=False)
+    # Plot 2: Raw correlation with energy-based threshold (like RTL)
+    energy_thresh_plot_path = plots_dir / "minn_energy_thresh.png"
+    fig, ax = plt.subplots(figsize=(12, 5))
+    
+    # Normalize for visualization
+    max_corr = np.max(corr_raw) if np.max(corr_raw) > 0 else 1
+    corr_norm = corr_raw / max_corr
+    thresh_norm = energy_thresh / max_corr
+    
+    ax.plot(corr_norm, label="Correlation |P|²", color="tab:orange", alpha=0.8)
+    ax.plot(thresh_norm, label=f"Threshold ({THRESH_FRAC:.0%} × R²)", color="gray", linestyle="--", alpha=0.7)
+    
+    # Mark peaks and expected
+    ax.axvline(peak_position, color="tab:red", linestyle=":", linewidth=2, label=f"Peak @ {peak_position}")
+    ax.axvline(expected_n_start, color="tab:green", linestyle="--", label="Expected N start")
+    
+    # Highlight sidelobes
+    ax.axhline(sidelobe_max / max_corr, color="tab:purple", linestyle=":", alpha=0.5, 
+               label=f"Max sidelobe ({sidelobe_ratio:.1f}× thresh)")
+    
+    ax.set_xlabel("Sample index d")
+    ax.set_ylabel("Normalized value")
+    ax.set_title(f"Minn Raw Correlation with Energy Threshold — {channel_desc}\n"
+                 f"Peak/Thresh={peak_ratio:.1f}×, Sidelobe/Thresh={sidelobe_ratio:.1f}×")
+    ax.legend(loc="upper right", fontsize=9)
+    ax.set_xlim(0, len(corr_raw))
+    plt.tight_layout()
+    plt.savefig(energy_thresh_plot_path, dpi=150)
+    plt.close()
+    print(f"  - minn_energy_thresh.png")
+    
+    fig, axes = plt.subplots(2, 1, figsize=(14, 7), sharex=False)
+    
+    # Calculate symbol boundaries for highlighting
+    preamble_len = CYCLIC_PREFIX + N_FFT  # Minn preamble with CP
+    ofdm_symbol_len = CYCLIC_PREFIX + N_FFT
+    
+    # Frame structure: [preamble (CP+N)] [pilot (CP+N)] [data (CP+N)]
+    preamble_cp_start = TX_PRE_PAD_SAMPLES + channel_peak_offset
+    preamble_n_start = preamble_cp_start + CYCLIC_PREFIX
+    pilot_cp_start_true = preamble_cp_start + preamble_len
+    pilot_n_start = pilot_cp_start_true + CYCLIC_PREFIX
+    data_cp_start_true = pilot_cp_start_true + ofdm_symbol_len
+    data_n_start = data_cp_start_true + CYCLIC_PREFIX
     
     combined_rx_mag = np.sqrt(np.sum(np.abs(rx_samples) ** 2, axis=0))
     axes[0].plot(combined_rx_mag, label="Combined |rx|")
     if rx_samples.ndim > 1 and rx_samples.shape[0] > 1:
         for idx, branch in enumerate(rx_samples):
             axes[0].plot(np.abs(branch), alpha=0.3, linewidth=0.8)
+    
+    # Gate highlighting
     for idx, (seg_start, seg_end) in enumerate(minn_gate_segments):
         gate_label = "Minn gate" if idx == 0 else None
         axes[0].axvspan(seg_start, seg_end, color="tab:orange", alpha=0.18, label=gate_label)
-    axes[0].axvline(true_cp_start, color="tab:purple", linestyle="--", label="CP start (true)")
-    axes[0].axvline(expected_n_start, color="tab:green", linestyle="--", label="N start (exp)")
-    axes[0].axvline(detected_start, color="tab:red", linestyle=":", label="Detected start")
+    
+    # Symbol boundary lines
+    axes[0].axvline(preamble_cp_start, color="tab:purple", linestyle="--", label="Preamble CP start")
+    axes[0].axvline(preamble_n_start, color="tab:purple", linestyle="-", alpha=0.7, label="Preamble N start")
+    axes[0].axvline(pilot_cp_start_true, color="tab:blue", linestyle="--", label="Pilot CP start")
+    axes[0].axvline(pilot_n_start, color="tab:cyan", linestyle="-", alpha=0.7, label="Pilot N start")
+    axes[0].axvline(data_cp_start_true, color="tab:brown", linestyle="--", label="Data CP start")
+    axes[0].axvline(data_n_start, color="tab:olive", linestyle="-", alpha=0.7, label="Data N start")
+    axes[0].axvline(detected_start, color="tab:red", linestyle=":", linewidth=2, label="Detected start")
     axes[0].set_ylabel("Magnitude")
     axes[0].set_title(f"Received Magnitude and Detected Start (Minn, {channel_desc})")
-    axes[0].legend(loc="upper right")
+    axes[0].legend(loc="upper right", fontsize=8)
     
     axes[1].plot(M, label="Minn M(d)", color="tab:orange")
     axes[1].plot(
@@ -434,12 +510,18 @@ def run_simulation(channel_name: str | None, plots_subdir: str):
     )
     for seg_start, seg_end in minn_gate_segments:
         axes[1].axvspan(seg_start, seg_end, color="tab:orange", alpha=0.12)
-    axes[1].axvline(peak_position, color="tab:red", linestyle=":", label=f"Minn peak @ {peak_position}")
-    axes[1].axvline(expected_n_start, color="tab:green", linestyle="--", label="Expected N start")
+    
+    # Symbol boundary lines on metric plot
+    axes[1].axvline(preamble_cp_start, color="tab:purple", linestyle="--", alpha=0.5)
+    axes[1].axvline(preamble_n_start, color="tab:purple", linestyle="-", alpha=0.5, label="Preamble N start")
+    axes[1].axvline(pilot_cp_start_true, color="tab:blue", linestyle="--", alpha=0.5)
+    axes[1].axvline(pilot_n_start, color="tab:cyan", linestyle="-", alpha=0.5, label="Pilot N start")
+    axes[1].axvline(peak_position, color="tab:red", linestyle=":", linewidth=2, label=f"Peak @ {peak_position}")
+    axes[1].axvline(detected_start, color="tab:red", linestyle="-", alpha=0.7, label="Detected start")
     axes[1].set_xlabel("Sample index d")
     axes[1].set_ylabel("M(d)")
     axes[1].set_title("Timing Metrics (Minn)")
-    axes[1].legend(loc="upper right")
+    axes[1].legend(loc="upper right", fontsize=8)
     
     fig.tight_layout()
     fig.savefig(results_plot_path, dpi=150)
