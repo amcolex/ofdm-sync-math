@@ -1,3 +1,178 @@
+"""
+RTL-Friendly OFDM Preamble Detector — "Adjacent Quarter Correlation" Method
+============================================================================
+
+THIS IS NOT THE STANDARD MINN METRIC. It is a streaming-friendly variant that
+was developed for FPGA implementation. It produces a single sharp peak (no
+plateau) and naturally aligns with the pilot symbol's FFT window start.
+
+
+PREAMBLE STRUCTURE
+------------------
+The preamble is a 5-SEGMENT structure, not 4. The leading segment (often called
+"CP") is NOT optional padding — it is ESSENTIAL for the timing metric to work:
+
+    [S0: -A] [S1: +A] [S2: +A] [S3: -A] [S4: -A]
+    |<-Q ->| |<-------------- N_FFT ------------>|
+
+    Total length: 5Q = N_FFT + Q = 1.25 × N_FFT samples
+
+Where:
+    - Q = N_FFT/4 = quarter length (512 samples for N=2048)
+    - A = pseudo-random BPSK sequence on every 4th subcarrier
+    - S0 is a copy of S4 (cyclic extension), so both contain -A
+
+The sign pattern [-A | +A | +A | -A | -A] creates specific correlation properties:
+    - Adjacent identical pairs: (S1,S2)=(+A,+A) and (S3,S4)=(-A,-A)
+    - Adjacent opposite pairs: (S0,S1)=(-A,+A) and (S2,S3)=(+A,-A)
+
+WITHOUT S0 (the leading -A), the metric would not produce a clean single peak.
+The leading -A ensures the correlation pattern cancels within the preamble and
+only peaks after it ends.
+
+
+WHAT THIS METRIC COMPUTES
+-------------------------
+Unlike standard Minn which correlates non-adjacent matching quarters (Q0↔Q1
+and Q2↔Q3), this RTL variant correlates ADJACENT quarters in a streaming
+pipeline:
+
+    quarter_product[n] = Re(x[n] · x*[n-Q])
+                       = x_I[n]·x_I[n-Q] + x_Q[n]·x_Q[n-Q]
+
+    corr_sum[n] = Σ_{k=0}^{Q-1} quarter_product[n-k]
+                = Re(⟨window[n-Q+1:n], window[n-2Q+1:n-Q]⟩)
+
+    corr_previous[n] = corr_sum[n-Q]  (delayed by one quarter)
+
+    corr_total[n] = corr_sum[n] + corr_previous[n]
+
+    corr_positive[n] = max(corr_total[n], 0)  (clip to positive)
+
+The metric sums TWO consecutive adjacent-quarter correlations. For threshold
+comparison, it uses:
+
+    above_threshold = (corr_positive × 2^FRAC_BITS) ≥ (energy_total × THRESH_VALUE)
+
+Where energy_total spans 3 consecutive Q-length windows for robustness.
+
+
+WHY THE PEAK APPEARS WHERE IT DOES
+----------------------------------
+For the preamble structure [S0:-A | S1:+A | S2:+A | S3:-A | S4:-A], adjacent
+segment correlations produce:
+
+    Window position         corr_sum             corr_previous         Total
+    (end of segment)        ⟨current, prev⟩      (from Q earlier)
+    ────────────────────────────────────────────────────────────────────────
+    S1 (+A)                 ⟨+A, -A⟩ = -|A|²     noise ≈ 0             ≈ 0
+    S2 (+A)                 ⟨+A, +A⟩ = +|A|²     ⟨+A, -A⟩ = -|A|²      ≈ 0 (cancel)
+    S3 (-A)                 ⟨-A, +A⟩ = -|A|²     ⟨+A, +A⟩ = +|A|²      ≈ 0 (cancel)
+    S4 (-A)                 ⟨-A, -A⟩ = +|A|²     ⟨-A, +A⟩ = -|A|²      ≈ 0 (cancel)
+    ────────────────────────────────────────────────────────────────────────
+    Pilot (Q after S4)      ⟨pilot, -A⟩ ≈ 0     ⟨-A, -A⟩ = +|A|²      ≈ +|A|² ← PEAK!
+
+KEY INSIGHT: Within the preamble, positive and negative correlations ALWAYS
+cancel because the sign pattern alternates: (-,+), (+,+), (+,-), (-,-).
+
+The peak occurs ONE QUARTER (Q) after the preamble ends because:
+  - corr_previous[n] "remembers" the strong S4↔S3 correlation (+|A|²)
+  - corr_sum[n] is correlating random pilot data with S4 (≈ 0)
+  - Total = 0 + |A|² = |A|²
+
+This happens at sample: n = preamble_end + Q = S0_start + 5Q + Q = S0_start + 6Q
+
+
+PEAK POSITION IN THE FRAME
+--------------------------
+    Frame structure (showing segment boundaries):
+
+    [guard][S0 S1 S2 S3 S4][Pilot CP][Pilot N: FFT here][Data...]
+           |<- Preamble ->|         |<- Pilot symbol ->|
+           |<---- 5Q ---->|<-- Q -->|<----- N -------->|
+
+    Preamble = 5Q = 2560 samples (for N=2048, Q=512)
+    Each OFDM symbol with CP = Q + N = 2560 samples
+
+    Peak occurs at: preamble_start + 5Q + Q = preamble_start + 6Q
+                  = preamble_start + 1.5 × N_FFT
+
+    Equivalently: pilot_N_start (start of pilot's FFT window)
+
+    With TIMING_OFFSET = 0, the detected frame_start pulse fires at the
+    pilot's FFT window start — no offset calculation needed in RTL.
+
+    NOTE: The "preamble CP" and "pilot CP" happen to be the same length (Q),
+    but this is a system design choice, not a requirement of this method.
+
+
+TIMING OFFSET OPTIONS
+---------------------
+    TIMING_OFFSET = 0
+        → frame_start at pilot N-start (default, recommended for FFT)
+        → Peak position, no adjustment needed
+
+    TIMING_OFFSET = -Q  # = -512 for N=2048
+        → frame_start at pilot CP-start (= end of preamble S4)
+
+    TIMING_OFFSET = -2Q  # = -1024
+        → frame_start at end of preamble S3
+
+    TIMING_OFFSET = -(Q + N)  # = -2560
+        → frame_start at preamble S1-start (start of "N portion")
+
+    TIMING_OFFSET = -(Q + N + Q)  # = -3072
+        → frame_start at preamble S0-start (very beginning)
+
+
+ADVANTAGES OVER STANDARD MINN
+-----------------------------
+1. SINGLE SHARP PEAK — No plateau ambiguity; decisive timing detection
+2. REAL-ONLY MATH — Uses only Re(x·x*), reducing FPGA multipliers
+3. STREAMING PIPELINE — Natural fit for sample-by-sample processing
+4. CFO TOLERANT — Real-part correlation is less sensitive to phase rotation
+5. MULTIPATH ROBUST — Wide 3Q energy window averages out fading
+
+
+COMPARISON TO STANDARD MINN
+---------------------------
+                        Standard Minn           This RTL Variant
+    ─────────────────────────────────────────────────────────────
+    Correlates          S1↔S2 and S3↔S4         Adjacent: Sn↔Sn-1
+    Peak shape          Plateau (~Q samples)    Single sharp peak
+    Peak location       Within preamble         Q after preamble end
+    Peak relative to    Preamble "N-start"      Pilot "N-start"
+    Math                Complex correlation     Real part only
+    CFO estimation      From arg(P)             Not available
+    Pipeline friendly   Moderate                Excellent
+
+
+PIPELINE DELAYS (for RTL implementation)
+----------------------------------------
+    Component           Delay (samples)
+    ─────────────────────────────────────
+    delay_i, delay_q    Q (quarter length)
+    corr_window         Q (running sum fill)
+    corr_delay          Q
+    energy_delay_q      Q
+    energy_delay_2q     Q
+    ─────────────────────────────────────
+    Total until valid   ~3Q to 4Q samples
+
+    The metric becomes valid (taps_valid=1) after all delay lines are filled.
+
+
+SIMULATION PARAMETERS (configurable below)
+------------------------------------------
+    SNR_DB              Signal-to-noise ratio for simulation
+    CFO_HZ              Carrier frequency offset to apply
+    SMOOTH_SHIFT        Exponential smoothing: smooth += (new - smooth) >> shift
+    THRESH_FRAC_BITS    Fixed-point fractional bits for threshold comparison
+    THRESH_VALUE        Threshold as fraction: THRESH_VALUE / 2^FRAC_BITS
+    HYSTERESIS          Samples below threshold before gate closes
+    TIMING_OFFSET       Offset from peak to frame_start (0 = pilot N-start)
+"""
+
 import numpy as np
 import matplotlib.pyplot as plt
 from dataclasses import dataclass
@@ -28,24 +203,52 @@ from core import (
 )
 
 
-def build_minn_preamble(rng: np.random.Generator, include_cp: bool = True) -> np.ndarray:
-    """Build Minn preamble with 4-fold structure: A A -A -A."""
+def build_minn_preamble(rng: np.random.Generator) -> np.ndarray:
+    """Build the 5-segment preamble: [S0:-A | S1:+A | S2:+A | S3:-A | S4:-A].
+
+    The preamble is constructed explicitly as 5 quarter-length segments,
+    NOT as a "symbol with cyclic prefix". S0 is essential to the timing
+    metric, not optional padding.
+
+    Structure:
+        S0 = -A (copy of S4, provides leading correlation reference)
+        S1 = +A
+        S2 = +A
+        S3 = -A
+        S4 = -A
+
+    Total length: 5Q = 5 * (N_FFT // 4) = 1.25 * N_FFT samples
+
+    Returns:
+        preamble: Complex samples of length 5Q
+    """
+    Q = N_FFT // 4  # Quarter length (segment length)
+
+    # Generate base sequence A using every 4th subcarrier (creates Q-periodic time signal)
     all_idx = centered_subcarrier_indices(NUM_ACTIVE_SUBCARRIERS)
     quarter_idx = all_idx[(all_idx % 4) == 0]
     bpsk = rng.choice([-1.0, 1.0], size=quarter_idx.shape[0])
     spectrum = allocate_subcarriers(N_FFT, quarter_idx, bpsk)
-    symbol = np.fft.ifft(np.fft.ifftshift(spectrum))
 
-    half = N_FFT // 2
-    symbol[half:] = -symbol[half:]
+    # IFFT gives [A, A, A, A] structure (4 identical quarters due to 4-spacing in freq)
+    time_domain = np.fft.ifft(np.fft.ifftshift(spectrum))
+    A = time_domain[:Q]  # Extract one quarter = the base sequence A
 
-    power = np.mean(np.abs(symbol) ** 2)
+    # Build the 5 segments explicitly
+    S0 = -A  # Leading segment (same as S4)
+    S1 = +A
+    S2 = +A
+    S3 = -A
+    S4 = -A
+
+    preamble = np.concatenate([S0, S1, S2, S3, S4])
+
+    # Normalize to unit power
+    power = np.mean(np.abs(preamble) ** 2)
     if power > 0:
-        symbol = symbol / np.sqrt(power)
+        preamble = preamble / np.sqrt(power)
 
-    if include_cp:
-        return add_cyclic_prefix(symbol, CYCLIC_PREFIX)
-    return symbol
+    return preamble
 
 
 def _reconstruct_cir_from_ls(h_used: np.ndarray) -> np.ndarray:
@@ -484,7 +687,7 @@ def run_simulation(channel_name: str | None, plots_subdir: str) -> None:
     const_plot_path = plots_dir / "constellation.png"
     sto_plot_path = plots_dir / "phase_slope_sto.png"
 
-    minn_preamble = build_minn_preamble(rng, include_cp=True)
+    minn_preamble = build_minn_preamble(rng)
     pilot_symbol, pilot_used = build_random_qpsk_symbol(rng, include_cp=True)
     data_symbol, data_used = build_random_qpsk_symbol(rng, include_cp=True)
     frame = np.concatenate((minn_preamble, pilot_symbol, data_symbol))
@@ -544,15 +747,18 @@ def run_simulation(channel_name: str | None, plots_subdir: str) -> None:
             cir_plot_path,
         )
 
-    true_cp_starts = [start + channel_peak_offset for start in frame_starts]
-    preamble_n_starts = [cp_start + CYCLIC_PREFIX for cp_start in true_cp_starts]
+    # Preamble boundaries (using 5-segment structure: S0 S1 S2 S3 S4)
+    Q = N_FFT // 4  # Quarter/segment length (512 for N=2048)
+    preamble_len = 5 * Q  # = 2560 samples for N=2048
+    preamble_s0_starts = [start + channel_peak_offset for start in frame_starts]
+    preamble_s1_starts = [s0 + Q for s0 in preamble_s0_starts]  # Start of S1
 
-    # Compute pilot and data symbol boundaries for each frame
-    preamble_len = CYCLIC_PREFIX + N_FFT
-    symbol_len = CYCLIC_PREFIX + N_FFT
-    pilot_cp_starts = [cp_start + preamble_len for cp_start in true_cp_starts]
+    # Pilot and data symbol boundaries (these use standard OFDM CP + N structure)
+    # Note: In this config, CYCLIC_PREFIX == Q, but they're conceptually different
+    ofdm_symbol_len = CYCLIC_PREFIX + N_FFT
+    pilot_cp_starts = [s0 + preamble_len for s0 in preamble_s0_starts]
     pilot_n_starts = [cp + CYCLIC_PREFIX for cp in pilot_cp_starts]
-    data_cp_starts = [cp_start + preamble_len + symbol_len for cp_start in true_cp_starts]
+    data_cp_starts = [s0 + preamble_len + ofdm_symbol_len for s0 in preamble_s0_starts]
     data_n_starts = [cp + CYCLIC_PREFIX for cp in data_cp_starts]
 
     # RTL peak aligns with pilot N-start - this is where we expect the detection
@@ -612,9 +818,9 @@ def run_simulation(channel_name: str | None, plots_subdir: str) -> None:
     for seg_idx, (start, end) in enumerate(gate_segments):
         gate_label = "Gate window" if seg_idx == 0 else None
         axes[0].axvspan(start, end, color="tab:orange", alpha=0.18, label=gate_label)
-    for idx, cp_start in enumerate(true_cp_starts):
-        cp_label = "Preamble CP start" if idx == 0 else None
-        axes[0].axvline(cp_start, color="tab:purple", linestyle="--", label=cp_label)
+    for idx, s0_start in enumerate(preamble_s0_starts):
+        s0_label = "Preamble S0 start" if idx == 0 else None
+        axes[0].axvline(s0_start, color="tab:purple", linestyle="--", label=s0_label)
     for idx, expected in enumerate(expected_n_starts):
         exp_label = "Pilot N start (exp)" if idx == 0 else None
         axes[0].axvline(expected, color="tab:green", linestyle="--", label=exp_label)
