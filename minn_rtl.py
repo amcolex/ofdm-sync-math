@@ -445,7 +445,9 @@ SMOOTH_SHIFT = 3
 THRESH_FRAC_BITS = 15
 THRESH_VALUE = int(0.10 * (1 << THRESH_FRAC_BITS))
 HYSTERESIS = 2
-TIMING_OFFSET = 0
+# RTL peak occurs at N + Q samples after N-start (end of preamble + one quarter)
+# This is because corr_previous captures Q3-Q2 correlation as the window slides past
+TIMING_OFFSET = -(N_FFT + N_FFT // 4)  # = -2560 for N_FFT=2048
 
 PLOTS_BASE_DIR = Path("plots") / "minn_rtl"
 
@@ -544,6 +546,17 @@ def run_simulation(channel_name: str | None, plots_subdir: str) -> None:
 
     true_cp_starts = [start + channel_peak_offset for start in frame_starts]
     expected_n_starts = [cp_start + CYCLIC_PREFIX for cp_start in true_cp_starts]
+
+    # Compute pilot and data symbol boundaries for each frame
+    preamble_len = CYCLIC_PREFIX + N_FFT
+    symbol_len = CYCLIC_PREFIX + N_FFT
+    pilot_cp_starts = [cp_start + preamble_len for cp_start in true_cp_starts]
+    pilot_n_starts = [cp + CYCLIC_PREFIX for cp in pilot_cp_starts]
+    data_cp_starts = [cp_start + preamble_len + symbol_len for cp_start in true_cp_starts]
+    data_n_starts = [cp + CYCLIC_PREFIX for cp in data_cp_starts]
+    # Theoretical RTL peak position: N + Q samples after preamble N start
+    # (peak occurs when corr_previous captures the Q3-Q2 correlation)
+    theoretical_peak_positions = [n_start + N_FFT + N_FFT // 4 for n_start in expected_n_starts]
     if expected_n_starts:
         primary_expected = expected_n_starts[0]
         timing_error = detected_start - primary_expected
@@ -587,7 +600,7 @@ def run_simulation(channel_name: str | None, plots_subdir: str) -> None:
     plt.savefig(metric_plot_path, dpi=150)
     plt.close()
 
-    fig, axes = plt.subplots(2, 1, figsize=(10, 6), sharex=False)
+    fig, axes = plt.subplots(2, 1, figsize=(14, 7), sharex=False)
 
     combined_rx_mag = np.sqrt(np.sum(np.abs(rx_samples) ** 2, axis=0))
     axes[0].plot(combined_rx_mag, label="Combined |rx|")
@@ -606,9 +619,27 @@ def run_simulation(channel_name: str | None, plots_subdir: str) -> None:
     for idx, det in enumerate(detected_lines):
         det_label = "Detected start" if idx == 0 else None
         axes[0].axvline(det, color="tab:red", linestyle=":", label=det_label)
+    # Theoretical peak position (N + Q after preamble N start)
+    for idx, theo_peak in enumerate(theoretical_peak_positions):
+        lbl = "Theo. peak (N+Q)" if idx == 0 else None
+        axes[0].axvline(theo_peak, color="tab:pink", linestyle="-.", linewidth=2, label=lbl)
+    # Pilot symbol boundaries
+    for idx, cp_start in enumerate(pilot_cp_starts):
+        lbl = "Pilot CP start" if idx == 0 else None
+        axes[0].axvline(cp_start, color="tab:blue", linestyle="--", alpha=0.7, label=lbl)
+    for idx, n_start in enumerate(pilot_n_starts):
+        lbl = "Pilot N start" if idx == 0 else None
+        axes[0].axvline(n_start, color="tab:cyan", linestyle="--", alpha=0.7, label=lbl)
+    # Data symbol boundaries
+    for idx, cp_start in enumerate(data_cp_starts):
+        lbl = "Data CP start" if idx == 0 else None
+        axes[0].axvline(cp_start, color="tab:brown", linestyle="--", alpha=0.7, label=lbl)
+    for idx, n_start in enumerate(data_n_starts):
+        lbl = "Data N start" if idx == 0 else None
+        axes[0].axvline(n_start, color="tab:olive", linestyle="--", alpha=0.7, label=lbl)
     axes[0].set_ylabel("Magnitude")
     axes[0].set_title(f"Received Magnitude and Detected Start (Minn RTL, {channel_desc})")
-    axes[0].legend(loc="upper right")
+    axes[0].legend(loc="upper right", fontsize=8, ncol=2)
 
     axes[1].plot(metric_state.corr_positive, label="RTL corr_plus(d)", color="tab:purple")
     axes[1].plot(
@@ -626,10 +657,13 @@ def run_simulation(channel_name: str | None, plots_subdir: str) -> None:
     for idx, expected in enumerate(expected_n_starts):
         exp_label = "Expected N start" if idx == 0 else None
         axes[1].axvline(expected, color="tab:green", linestyle="--", label=exp_label)
+    for idx, theo_peak in enumerate(theoretical_peak_positions):
+        lbl = "Theo. peak (N+Q)" if idx == 0 else None
+        axes[1].axvline(theo_peak, color="tab:pink", linestyle="-.", linewidth=2, label=lbl)
     axes[1].set_xlabel("Sample index d")
     axes[1].set_ylabel("Metric")
     axes[1].set_title("Timing Metrics (Minn RTL)")
-    axes[1].legend(loc="upper right")
+    axes[1].legend(loc="upper right", fontsize=8)
 
     fig.tight_layout()
     fig.savefig(results_plot_path, dpi=150)
