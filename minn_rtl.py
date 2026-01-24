@@ -332,9 +332,19 @@ def _generate_base_sequence(seq_type: str, length: int, rng: np.random.Generator
     return A
 
 
-def build_minn_preamble_generic(seq_type: str, rng: np.random.Generator | None = None) -> np.ndarray:
-    """Build preamble with a specified base sequence type."""
-    Q = N_FFT // 4
+def build_minn_preamble_generic(seq_type: str, rng: np.random.Generator | None = None, Q: int | None = None) -> np.ndarray:
+    """Build preamble with a specified base sequence type.
+    
+    Args:
+        seq_type: Base sequence type (qpsk_freq, bpsk_freq, zc_time, etc.)
+        rng: Random generator for random sequences
+        Q: Segment length in samples. Default: N_FFT//4. Total preamble = 5*Q.
+    
+    Returns:
+        preamble: Complex samples of length 5*Q
+    """
+    if Q is None:
+        Q = N_FFT // 4
     A = _generate_base_sequence(seq_type, Q, rng)
 
     # Build the 5 segments: [S0:-A | S1:+A | S2:+A | S3:-A | S4:-A]
@@ -660,15 +670,21 @@ def minn_rtl_streaming_metric(
     smooth_shift: int,
     threshold_value: int,
     threshold_frac_bits: int,
+    quarter_len: int | None = None,
 ) -> MinnRTLMetricState:
-    """Compute the RTL-aligned Minn timing metric across all branches."""
+    """Compute the RTL-aligned Minn timing metric across all branches.
+    
+    Args:
+        quarter_len: Segment length Q. Default: N_FFT//4. Must match preamble Q.
+    """
     rx = np.asarray(rx, dtype=np.complex128)
     if rx.ndim == 1:
         rx = rx[np.newaxis, :]
     num_branches, length = rx.shape
-    quarter_len = N_FFT // 4
+    if quarter_len is None:
+        quarter_len = N_FFT // 4
     if quarter_len <= 0:
-        raise ValueError("N_FFT must be divisible by 4.")
+        raise ValueError("quarter_len must be positive.")
 
     branch_metrics = [_antenna_path(rx[b], quarter_len) for b in range(num_branches)]
 
@@ -816,6 +832,10 @@ SMOOTH_SHIFT = 3
 THRESH_FRAC_BITS = 15
 THRESH_VALUE = int(0.10 * (1 << THRESH_FRAC_BITS))
 HYSTERESIS = 2
+# Preamble segment length Q (total preamble = 5*Q samples)
+# Default: N_FFT//4 = 512 for 2560 total. Smaller Q = shorter preamble but less robust.
+PREAMBLE_Q = N_FFT // 4  # 512 samples per segment, 2560 total
+
 # Preamble base sequence type: "bpsk_freq", "qpsk_freq", "zc_time", "zc_freq", etc.
 # See _generate_base_sequence() for all options
 PREAMBLE_SEQ_TYPE = "qpsk_freq"  # QPSK gives ~10% higher peak than BPSK
@@ -858,7 +878,7 @@ def run_simulation(channel_name: str | None, plots_subdir: str) -> None:
     const_plot_path = plots_dir / "constellation.png"
     sto_plot_path = plots_dir / "phase_slope_sto.png"
 
-    minn_preamble = build_minn_preamble_generic(PREAMBLE_SEQ_TYPE, rng)
+    minn_preamble = build_minn_preamble_generic(PREAMBLE_SEQ_TYPE, rng, Q=PREAMBLE_Q)
     pilot_symbol, pilot_used = build_random_qpsk_symbol(rng, include_cp=True)
     data_symbol, data_used = build_random_qpsk_symbol(rng, include_cp=True)
     frame = np.concatenate((minn_preamble, pilot_symbol, data_symbol))
@@ -890,6 +910,7 @@ def run_simulation(channel_name: str | None, plots_subdir: str) -> None:
         smooth_shift=SMOOTH_SHIFT,
         threshold_value=THRESH_VALUE,
         threshold_frac_bits=THRESH_FRAC_BITS,
+        quarter_len=PREAMBLE_Q,
     )
     detection = detect_minn_rtl(
         metric_state,
@@ -919,8 +940,8 @@ def run_simulation(channel_name: str | None, plots_subdir: str) -> None:
         )
 
     # Preamble boundaries (using 5-segment structure: S0 S1 S2 S3 S4)
-    Q = N_FFT // 4  # Quarter/segment length (512 for N=2048)
-    preamble_len = 5 * Q  # = 2560 samples for N=2048
+    Q = PREAMBLE_Q  # Segment length (default 512 for N=2048)
+    preamble_len = 5 * Q  # = 2560 samples by default
     preamble_s0_starts = [start + channel_peak_offset for start in frame_starts]
     preamble_s1_starts = [s0 + Q for s0 in preamble_s0_starts]  # Start of S1
 
@@ -1182,7 +1203,8 @@ def run_sequence_comparison(channel_name: str | None) -> None:
         rng = np.random.default_rng(0)  # Consistent RNG
 
         # Build frame with this sequence type
-        preamble = build_minn_preamble_generic(seq_type, rng)
+        Q = PREAMBLE_Q
+        preamble = build_minn_preamble_generic(seq_type, rng, Q=Q)
         pilot_symbol, _ = build_random_qpsk_symbol(rng, include_cp=True)
         data_symbol, _ = build_random_qpsk_symbol(rng, include_cp=True)
         frame = np.concatenate((preamble, pilot_symbol, data_symbol))
@@ -1202,11 +1224,11 @@ def run_sequence_comparison(channel_name: str | None) -> None:
             smooth_shift=SMOOTH_SHIFT,
             threshold_value=THRESH_VALUE,
             threshold_frac_bits=THRESH_FRAC_BITS,
+            quarter_len=Q,
         )
         detection = detect_minn_rtl(metric_state, hysteresis=HYSTERESIS, timing_offset=TIMING_OFFSET)
 
         # Get timing info
-        Q = N_FFT // 4
         preamble_len = 5 * Q
         channel_peak_offset = compute_channel_peak_offset(channel_impulse_response)
         frame_starts = [leading_guard.size, leading_guard.size + frame_len + inter_guard.size]
@@ -1328,6 +1350,7 @@ def run_comparison(channel_name: str | None, plots_subdir: str) -> None:
         rng = np.random.default_rng(0)  # Reset RNG for consistent noise
 
         # Build frame
+        Q = PREAMBLE_Q
         preamble = build_minn_preamble(rng, use_zc=use_zc, zc_root=ZC_ROOT)
         pilot_symbol, _ = build_random_qpsk_symbol(rng, include_cp=True)
         data_symbol, _ = build_random_qpsk_symbol(rng, include_cp=True)
@@ -1347,11 +1370,11 @@ def run_comparison(channel_name: str | None, plots_subdir: str) -> None:
             smooth_shift=SMOOTH_SHIFT,
             threshold_value=THRESH_VALUE,
             threshold_frac_bits=THRESH_FRAC_BITS,
+            quarter_len=Q,
         )
         detection = detect_minn_rtl(metric_state, hysteresis=HYSTERESIS, timing_offset=TIMING_OFFSET)
 
         # Get timing info
-        Q = N_FFT // 4
         preamble_len = 5 * Q
         channel_peak_offset = compute_channel_peak_offset(channel_impulse_response)
         frame_starts = [leading_guard.size, leading_guard.size + frame_len + inter_guard.size]
@@ -1465,6 +1488,247 @@ def main() -> None:
     print(f"  - {(PLOTS_BASE_DIR / 'flat_awgn').resolve()}")
     print(f"  - {(PLOTS_BASE_DIR / 'comparison').resolve()}")
     print("=" * 70 + "\n")
+
+
+def compare_q_values(
+    q_values: list[int],
+    channel_name: str | None = None,
+) -> dict[int, dict]:
+    """Compare detection performance across different Q (segment length) values.
+    
+    Args:
+        q_values: List of Q values to test (segment lengths)
+        channel_name: Channel CIR file name or None for flat AWGN
+        
+    Returns:
+        Dictionary mapping Q -> {peak, par, pmr, timing_error, preamble_len, overhead_pct}
+    """
+    channel_impulse_response = None
+    if channel_name:
+        cir_bank = load_measured_cir(channel_name)
+        channel_impulse_response = cir_bank[:2].copy() if cir_bank.shape[0] > 2 else cir_bank.copy()
+    channel_peak_offset = compute_channel_peak_offset(channel_impulse_response)
+    
+    results: dict[int, dict] = {}
+    
+    for Q in q_values:
+        rng = np.random.default_rng(0)
+        
+        # Build preamble with this Q
+        preamble = build_minn_preamble_generic(PREAMBLE_SEQ_TYPE, rng, Q=Q)
+        preamble_len = 5 * Q
+        
+        # Build rest of frame (unchanged)
+        pilot_symbol, _ = build_random_qpsk_symbol(rng, include_cp=True)
+        data_symbol, _ = build_random_qpsk_symbol(rng, include_cp=True)
+        frame = np.concatenate((preamble, pilot_symbol, data_symbol))
+        frame_len = frame.size
+        
+        # Calculate overhead
+        payload_len = pilot_symbol.size + data_symbol.size
+        overhead_pct = 100.0 * preamble_len / frame_len
+        
+        # Build TX stream
+        inter_guard = np.zeros(frame_len, dtype=complex)
+        leading_guard = np.zeros(TX_PRE_PAD_SAMPLES, dtype=complex)
+        tx_samples = np.concatenate((leading_guard, frame, inter_guard, frame))
+        
+        # Apply channel
+        rng2 = np.random.default_rng(0)
+        rx_samples = apply_channel(tx_samples, SNR_DB, rng2, channel_impulse_response=channel_impulse_response)
+        rx_samples = apply_cfo(rx_samples, CFO_HZ, SAMPLE_RATE_HZ)
+        
+        # Compute metric with this Q
+        metric_state = minn_rtl_streaming_metric(
+            rx_samples,
+            smooth_shift=SMOOTH_SHIFT,
+            threshold_value=THRESH_VALUE,
+            threshold_frac_bits=THRESH_FRAC_BITS,
+            quarter_len=Q,
+        )
+        detection = detect_minn_rtl(metric_state, hysteresis=HYSTERESIS, timing_offset=TIMING_OFFSET)
+        
+        # Get timing info
+        frame_starts = [leading_guard.size, leading_guard.size + frame_len + inter_guard.size]
+        preamble_s0_starts = [start + channel_peak_offset for start in frame_starts]
+        pilot_n_starts = [s0 + preamble_len + CYCLIC_PREFIX for s0 in preamble_s0_starts]
+        
+        # Analyze metric
+        metric = metric_state.corr_positive
+        if detection.events:
+            peak_idx = detection.events[0].peak_index
+            timing_error = detection.events[0].detected_index - pilot_n_starts[0]
+        else:
+            peak_idx = int(np.argmax(metric_state.smooth_metric))
+            timing_error = peak_idx - pilot_n_starts[0]
+        
+        peak_val = float(metric[peak_idx])
+        
+        # Compute noise floor (excluding peak region)
+        peak_region = range(max(0, peak_idx - 500), min(len(metric), peak_idx + 500))
+        mask = np.ones(len(metric), dtype=bool)
+        mask[list(peak_region)] = False
+        mask[:TX_PRE_PAD_SAMPLES] = False
+        noise_vals = metric[mask]
+        
+        if noise_vals.size > 0:
+            avg_noise = float(np.mean(noise_vals))
+            max_noise = float(np.max(noise_vals))
+            par = peak_val / avg_noise if avg_noise > 0 else float('inf')
+            pmr = peak_val / max_noise if max_noise > 0 else float('inf')
+        else:
+            par = float('inf')
+            pmr = float('inf')
+        
+        results[Q] = {
+            "peak": peak_val,
+            "par": par,
+            "pmr": pmr,
+            "timing_error": timing_error,
+            "preamble_len": preamble_len,
+            "overhead_pct": overhead_pct,
+        }
+    
+    return results
+
+
+def run_q_comparison(channel_name: str | None = None) -> None:
+    """Run and print Q value comparison."""
+    # Test a range of Q values (powers of 2 for easier RTL)
+    q_values = [64, 128, 256, 512]
+    
+    channel_desc = f"Measured CIR '{channel_name}'" if channel_name else "Flat AWGN"
+    print(f"\n{'='*70}")
+    print(f"Q VALUE COMPARISON - {channel_desc}")
+    print(f"{'='*70}")
+    print(f"N_FFT={N_FFT}, Default Q={N_FFT//4}")
+    print()
+    
+    results = compare_q_values(q_values, channel_name)
+    
+    # Print header
+    print(f"{'Q':>6} | {'5*Q':>6} | {'Overhead':>8} | {'Peak':>10} | {'PAR':>6} | {'PMR':>6} | {'Timing':>8}")
+    print("-" * 70)
+    
+    for Q in q_values:
+        r = results[Q]
+        print(f"{Q:>6} | {r['preamble_len']:>6} | {r['overhead_pct']:>7.1f}% | {r['peak']:>10.0f} | {r['par']:>6.1f} | {r['pmr']:>6.2f} | {r['timing_error']:>+8}")
+    
+    print()
+
+
+def plot_q_comparison(q_values: list[int] | None = None, snr_db: float | None = None) -> None:
+    """Create comparison plots for different Q values in both AWGN and multipath."""
+    if q_values is None:
+        q_values = [64, 128, 256, 512]
+    if snr_db is None:
+        snr_db = SNR_DB
+    
+    plots_dir = PLOTS_BASE_DIR / "q_comparison"
+    plots_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Colors for each Q value
+    colors = {64: "tab:red", 128: "tab:orange", 256: "tab:green", 512: "tab:blue"}
+    
+    for channel_name, channel_label, subdir in [
+        (None, "Flat AWGN", "flat_awgn"),
+        ("cir1", "Multipath (cir1)", "measured_channel"),
+    ]:
+        channel_impulse_response = None
+        if channel_name:
+            cir_bank = load_measured_cir(channel_name)
+            channel_impulse_response = cir_bank[:2].copy() if cir_bank.shape[0] > 2 else cir_bank.copy()
+        channel_peak_offset = compute_channel_peak_offset(channel_impulse_response)
+        
+        fig, axes = plt.subplots(len(q_values), 1, figsize=(14, 3 * len(q_values)), sharex=True)
+        
+        for ax_idx, Q in enumerate(q_values):
+            ax = axes[ax_idx]
+            rng = np.random.default_rng(0)
+            
+            # Build preamble with this Q
+            preamble = build_minn_preamble_generic(PREAMBLE_SEQ_TYPE, rng, Q=Q)
+            preamble_len = 5 * Q
+            
+            # Build rest of frame
+            pilot_symbol, _ = build_random_qpsk_symbol(rng, include_cp=True)
+            data_symbol, _ = build_random_qpsk_symbol(rng, include_cp=True)
+            frame = np.concatenate((preamble, pilot_symbol, data_symbol))
+            frame_len = frame.size
+            
+            # Build TX stream
+            inter_guard = np.zeros(frame_len, dtype=complex)
+            leading_guard = np.zeros(TX_PRE_PAD_SAMPLES, dtype=complex)
+            tx_samples = np.concatenate((leading_guard, frame, inter_guard, frame))
+            
+            # Apply channel
+            rng2 = np.random.default_rng(0)
+            rx_samples = apply_channel(tx_samples, snr_db, rng2, channel_impulse_response=channel_impulse_response)
+            rx_samples = apply_cfo(rx_samples, CFO_HZ, SAMPLE_RATE_HZ)
+            
+            # Compute metric with this Q
+            metric_state = minn_rtl_streaming_metric(
+                rx_samples,
+                smooth_shift=SMOOTH_SHIFT,
+                threshold_value=THRESH_VALUE,
+                threshold_frac_bits=THRESH_FRAC_BITS,
+                quarter_len=Q,
+            )
+            detection = detect_minn_rtl(metric_state, hysteresis=HYSTERESIS, timing_offset=TIMING_OFFSET)
+            
+            # Expected peak position: preamble_start + 6*Q (running sum completes Q after preamble ends)
+            frame_starts = [leading_guard.size, leading_guard.size + frame_len + inter_guard.size]
+            preamble_s0_starts = [start + channel_peak_offset for start in frame_starts]
+            expected_peaks = [s0 + 6 * Q for s0 in preamble_s0_starts]
+            
+            # Find peak in FIRST FRAME region only (to avoid picking second frame)
+            first_frame_end = frame_starts[0] + frame_len + inter_guard.size // 2
+            metric = metric_state.corr_positive
+            first_frame_metric = metric[:first_frame_end].copy()
+            peak_idx = int(np.argmax(first_frame_metric))
+            timing_error = peak_idx - expected_peaks[0]
+            
+            # Compute threshold trace
+            denom = float(1 << THRESH_FRAC_BITS)
+            thresh_trace = np.zeros_like(metric)
+            valid_mask = metric_state.metric_valid
+            if denom > 0:
+                thresh_trace[valid_mask] = metric_state.energy_scaled[valid_mask] / denom
+            
+            # Compute metric/threshold ratio
+            ratio = np.zeros_like(metric)
+            nonzero_thresh = thresh_trace > 0
+            ratio[nonzero_thresh] = metric[nonzero_thresh] / thresh_trace[nonzero_thresh]
+            
+            # Get peak ratio value
+            peak_ratio = ratio[peak_idx] if peak_idx < len(ratio) else 0
+            
+            # Plot metric and threshold (both normalized to metric max for comparison)
+            max_metric = np.max(metric) if np.max(metric) > 0 else 1
+            metric_norm = metric / max_metric
+            thresh_norm = thresh_trace / max_metric
+            
+            ax.plot(metric_norm, label=f"Metric", color=colors[Q], alpha=0.8)
+            ax.plot(thresh_norm, label=f"Threshold", color="gray", linestyle="--", alpha=0.6)
+            
+            # Mark expected and detected peaks
+            for exp_peak in expected_peaks:
+                ax.axvline(exp_peak, color="green", linestyle="--", alpha=0.5, label="Expected" if exp_peak == expected_peaks[0] else None)
+            ax.axvline(peak_idx, color="red", linestyle=":", alpha=0.8, label=f"Detected")
+            
+            ax.set_ylabel("Metric (norm)")
+            ax.set_title(f"Q={Q}: preamble={5*Q}, err={timing_error:+d}, peak/thresh={peak_ratio:.1f}x")
+            ax.legend(loc="upper right", fontsize=8)
+            ax.set_xlim(0, len(metric))
+        
+        axes[-1].set_xlabel("Sample index")
+        fig.suptitle(f"Q Value Comparison - {channel_label} (SNR={snr_db:.0f} dB)", fontsize=14, fontweight="bold")
+        plt.tight_layout()
+        
+        out_path = plots_dir / f"{subdir}_q_comparison_snr{int(snr_db):+d}dB.png"
+        plt.savefig(out_path, dpi=150)
+        plt.close()
+        print(f"Saved: {out_path}")
 
 
 if __name__ == "__main__":
