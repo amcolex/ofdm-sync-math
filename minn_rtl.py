@@ -203,7 +203,152 @@ from core import (
 )
 
 
-def build_minn_preamble(rng: np.random.Generator) -> np.ndarray:
+def _generate_zc_sequence(length: int, root: int = 1) -> np.ndarray:
+    """Generate a Zadoff-Chu sequence of given length.
+
+    ZC sequences have:
+    - Constant amplitude (PAPR = 0 dB)
+    - Ideal cyclic autocorrelation (impulse)
+    - Low cross-correlation between different roots
+
+    Args:
+        length: Sequence length (should be prime for ideal properties, but works for any)
+        root: ZC root index (1 to length-1), coprime with length for ideal properties
+
+    Returns:
+        Complex ZC sequence of unit power
+    """
+    n = np.arange(length)
+    # ZC formula: x[n] = exp(-j * pi * u * n * (n + 1) / N) for odd N
+    #             x[n] = exp(-j * pi * u * n^2 / N) for even N
+    if length % 2 == 1:
+        zc = np.exp(-1j * np.pi * root * n * (n + 1) / length)
+    else:
+        zc = np.exp(-1j * np.pi * root * n * n / length)
+    return zc
+
+
+def _generate_base_sequence(seq_type: str, length: int, rng: np.random.Generator | None = None) -> np.ndarray:
+    """Generate various base sequences for the preamble.
+
+    Args:
+        seq_type: One of:
+            - "bpsk_freq": Random BPSK on every 4th subcarrier (original)
+            - "qpsk_freq": Random QPSK on every 4th subcarrier
+            - "zc_time": Zadoff-Chu directly in time domain
+            - "zc_freq": ZC-like sequence on every 4th subcarrier
+            - "chirp": Linear frequency chirp
+            - "gold": Gold-code-like binary sequence
+            - "const": Constant (all ones) - baseline
+            - "random_phase": Random phase, constant amplitude
+        length: Sequence length Q
+        rng: Random generator (required for random sequences)
+
+    Returns:
+        Complex sequence of length Q, normalized to unit power
+    """
+    Q = length
+
+    if seq_type == "bpsk_freq":
+        # Original: Random BPSK on every 4th subcarrier
+        if rng is None:
+            raise ValueError("rng required for bpsk_freq")
+        all_idx = centered_subcarrier_indices(NUM_ACTIVE_SUBCARRIERS)
+        quarter_idx = all_idx[(all_idx % 4) == 0]
+        bpsk = rng.choice([-1.0, 1.0], size=quarter_idx.shape[0])
+        spectrum = allocate_subcarriers(N_FFT, quarter_idx, bpsk)
+        time_domain = np.fft.ifft(np.fft.ifftshift(spectrum))
+        A = time_domain[:Q]
+
+    elif seq_type == "qpsk_freq":
+        # Random QPSK on every 4th subcarrier
+        if rng is None:
+            raise ValueError("rng required for qpsk_freq")
+        all_idx = centered_subcarrier_indices(NUM_ACTIVE_SUBCARRIERS)
+        quarter_idx = all_idx[(all_idx % 4) == 0]
+        phases = rng.choice([0, 1, 2, 3], size=quarter_idx.shape[0])
+        qpsk = np.exp(1j * np.pi / 4 * (2 * phases + 1))
+        spectrum = allocate_subcarriers(N_FFT, quarter_idx, qpsk)
+        time_domain = np.fft.ifft(np.fft.ifftshift(spectrum))
+        A = time_domain[:Q]
+
+    elif seq_type == "zc_time":
+        # Zadoff-Chu directly in time domain
+        A = _generate_zc_sequence(Q, root=7)
+
+    elif seq_type == "zc_freq":
+        # ZC-like sequence on every 4th subcarrier
+        all_idx = centered_subcarrier_indices(NUM_ACTIVE_SUBCARRIERS)
+        quarter_idx = all_idx[(all_idx % 4) == 0]
+        n_subcarriers = quarter_idx.shape[0]
+        # Apply ZC-like phase progression to subcarriers
+        k = np.arange(n_subcarriers)
+        zc_phases = np.exp(-1j * np.pi * 7 * k * k / n_subcarriers)
+        spectrum = allocate_subcarriers(N_FFT, quarter_idx, zc_phases)
+        time_domain = np.fft.ifft(np.fft.ifftshift(spectrum))
+        A = time_domain[:Q]
+
+    elif seq_type == "chirp":
+        # Linear frequency chirp
+        n = np.arange(Q)
+        # Chirp from 0 to half sampling rate
+        A = np.exp(1j * np.pi * n * n / Q)
+
+    elif seq_type == "gold":
+        # Gold-code-like: XOR of two m-sequences mapped to ±1
+        # Use a simple LFSR-based approach
+        if rng is None:
+            rng = np.random.default_rng(42)
+        # Generate pseudo-random binary with good autocorrelation
+        bits = np.zeros(Q, dtype=int)
+        state1, state2 = 0b1010101010, 0b1100110011
+        for i in range(Q):
+            bit1 = (state1 >> 9) & 1
+            bit2 = (state2 >> 9) & 1
+            bits[i] = bit1 ^ bit2
+            state1 = ((state1 << 1) | ((state1 >> 9) ^ (state1 >> 6)) & 1) & 0x3FF
+            state2 = ((state2 << 1) | ((state2 >> 9) ^ (state2 >> 8) ^ (state2 >> 5) ^ (state2 >> 3)) & 1) & 0x3FF
+        A = 2.0 * bits - 1.0 + 0j  # Map to ±1
+
+    elif seq_type == "const":
+        # Constant - baseline (worst case)
+        A = np.ones(Q, dtype=complex)
+
+    elif seq_type == "random_phase":
+        # Constant amplitude, random phase (CAZAC-like)
+        if rng is None:
+            raise ValueError("rng required for random_phase")
+        phases = rng.uniform(0, 2 * np.pi, Q)
+        A = np.exp(1j * phases)
+
+    else:
+        raise ValueError(f"Unknown sequence type: {seq_type}")
+
+    # Normalize to unit power
+    power = np.mean(np.abs(A) ** 2)
+    if power > 0:
+        A = A / np.sqrt(power)
+
+    return A
+
+
+def build_minn_preamble_generic(seq_type: str, rng: np.random.Generator | None = None) -> np.ndarray:
+    """Build preamble with a specified base sequence type."""
+    Q = N_FFT // 4
+    A = _generate_base_sequence(seq_type, Q, rng)
+
+    # Build the 5 segments: [S0:-A | S1:+A | S2:+A | S3:-A | S4:-A]
+    preamble = np.concatenate([-A, +A, +A, -A, -A])
+
+    # Normalize to unit power
+    power = np.mean(np.abs(preamble) ** 2)
+    if power > 0:
+        preamble = preamble / np.sqrt(power)
+
+    return preamble
+
+
+def build_minn_preamble(rng: np.random.Generator | None = None, use_zc: bool = False, zc_root: int = 1) -> np.ndarray:
     """Build the 5-segment preamble: [S0:-A | S1:+A | S2:+A | S3:-A | S4:-A].
 
     The preamble is constructed explicitly as 5 quarter-length segments,
@@ -219,20 +364,43 @@ def build_minn_preamble(rng: np.random.Generator) -> np.ndarray:
 
     Total length: 5Q = 5 * (N_FFT // 4) = 1.25 * N_FFT samples
 
+    Args:
+        rng: Random generator (required if use_zc=False)
+        use_zc: If True, use Zadoff-Chu sequence for A instead of random BPSK
+        zc_root: ZC root index (only used if use_zc=True)
+
     Returns:
         preamble: Complex samples of length 5Q
+
+    Base Sequence Options:
+        Random BPSK (default):
+            - Uses every 4th subcarrier with random ±1
+            - Requires RNG seed for reproducibility
+            - Higher PAPR (~3-4 dB)
+
+        Zadoff-Chu (use_zc=True):
+            - Constant envelope (PAPR = 0 dB)
+            - Ideal autocorrelation properties
+            - Deterministic (no seed needed)
+            - Better for power amplifier efficiency
     """
     Q = N_FFT // 4  # Quarter length (segment length)
 
-    # Generate base sequence A using every 4th subcarrier (creates Q-periodic time signal)
-    all_idx = centered_subcarrier_indices(NUM_ACTIVE_SUBCARRIERS)
-    quarter_idx = all_idx[(all_idx % 4) == 0]
-    bpsk = rng.choice([-1.0, 1.0], size=quarter_idx.shape[0])
-    spectrum = allocate_subcarriers(N_FFT, quarter_idx, bpsk)
+    if use_zc:
+        # Generate ZC sequence directly in time domain
+        A = _generate_zc_sequence(Q, root=zc_root)
+    else:
+        # Generate base sequence A using every 4th subcarrier (creates Q-periodic time signal)
+        if rng is None:
+            raise ValueError("rng is required when use_zc=False")
+        all_idx = centered_subcarrier_indices(NUM_ACTIVE_SUBCARRIERS)
+        quarter_idx = all_idx[(all_idx % 4) == 0]
+        bpsk = rng.choice([-1.0, 1.0], size=quarter_idx.shape[0])
+        spectrum = allocate_subcarriers(N_FFT, quarter_idx, bpsk)
 
-    # IFFT gives [A, A, A, A] structure (4 identical quarters due to 4-spacing in freq)
-    time_domain = np.fft.ifft(np.fft.ifftshift(spectrum))
-    A = time_domain[:Q]  # Extract one quarter = the base sequence A
+        # IFFT gives [A, A, A, A] structure (4 identical quarters due to 4-spacing in freq)
+        time_domain = np.fft.ifft(np.fft.ifftshift(spectrum))
+        A = time_domain[:Q]  # Extract one quarter = the base sequence A
 
     # Build the 5 segments explicitly
     S0 = -A  # Leading segment (same as S4)
@@ -648,6 +816,9 @@ SMOOTH_SHIFT = 3
 THRESH_FRAC_BITS = 15
 THRESH_VALUE = int(0.10 * (1 << THRESH_FRAC_BITS))
 HYSTERESIS = 2
+# Preamble base sequence type: "bpsk_freq", "qpsk_freq", "zc_time", "zc_freq", etc.
+# See _generate_base_sequence() for all options
+PREAMBLE_SEQ_TYPE = "qpsk_freq"  # QPSK gives ~10% higher peak than BPSK
 # RTL peak naturally aligns with pilot N-start (end of preamble + pilot CP)
 # No offset needed - peak is already where we want to start FFT processing
 TIMING_OFFSET = 0
@@ -687,7 +858,7 @@ def run_simulation(channel_name: str | None, plots_subdir: str) -> None:
     const_plot_path = plots_dir / "constellation.png"
     sto_plot_path = plots_dir / "phase_slope_sto.png"
 
-    minn_preamble = build_minn_preamble(rng)
+    minn_preamble = build_minn_preamble_generic(PREAMBLE_SEQ_TYPE, rng)
     pilot_symbol, pilot_used = build_random_qpsk_symbol(rng, include_cp=True)
     data_symbol, data_used = build_random_qpsk_symbol(rng, include_cp=True)
     frame = np.concatenate((minn_preamble, pilot_symbol, data_symbol))
@@ -992,6 +1163,284 @@ def run_simulation(channel_name: str | None, plots_subdir: str) -> None:
     print(f"{'='*70}\n")
 
 
+def run_sequence_comparison(channel_name: str | None) -> None:
+    """Compare all base sequence types and measure peak-to-sidelobe ratio."""
+    seq_types = ["bpsk_freq", "qpsk_freq", "zc_time", "zc_freq", "chirp", "gold", "random_phase"]
+
+    channel_desc = f"Measured CIR '{channel_name}'" if channel_name else "Flat AWGN"
+
+    # Load channel
+    if channel_name is None:
+        channel_impulse_response = None
+    else:
+        cir_bank = load_measured_cir(channel_name)
+        channel_impulse_response = cir_bank[:2].copy() if cir_bank.shape[0] > 2 else cir_bank.copy()
+
+    results = []
+
+    for seq_type in seq_types:
+        rng = np.random.default_rng(0)  # Consistent RNG
+
+        # Build frame with this sequence type
+        preamble = build_minn_preamble_generic(seq_type, rng)
+        pilot_symbol, _ = build_random_qpsk_symbol(rng, include_cp=True)
+        data_symbol, _ = build_random_qpsk_symbol(rng, include_cp=True)
+        frame = np.concatenate((preamble, pilot_symbol, data_symbol))
+        frame_len = frame.size
+        inter_guard = np.zeros(frame_len, dtype=complex)
+        leading_guard = np.zeros(TX_PRE_PAD_SAMPLES, dtype=complex)
+        tx_samples = np.concatenate((leading_guard, frame, inter_guard, frame))
+
+        # Apply channel
+        rng2 = np.random.default_rng(0)  # Same noise for fair comparison
+        rx_samples = apply_channel(tx_samples, SNR_DB, rng2, channel_impulse_response=channel_impulse_response)
+        rx_samples = apply_cfo(rx_samples, CFO_HZ, SAMPLE_RATE_HZ)
+
+        # Compute metric
+        metric_state = minn_rtl_streaming_metric(
+            rx_samples,
+            smooth_shift=SMOOTH_SHIFT,
+            threshold_value=THRESH_VALUE,
+            threshold_frac_bits=THRESH_FRAC_BITS,
+        )
+        detection = detect_minn_rtl(metric_state, hysteresis=HYSTERESIS, timing_offset=TIMING_OFFSET)
+
+        # Get timing info
+        Q = N_FFT // 4
+        preamble_len = 5 * Q
+        channel_peak_offset = compute_channel_peak_offset(channel_impulse_response)
+        frame_starts = [leading_guard.size, leading_guard.size + frame_len + inter_guard.size]
+        preamble_s0_starts = [start + channel_peak_offset for start in frame_starts]
+        pilot_n_starts = [s0 + preamble_len + CYCLIC_PREFIX for s0 in preamble_s0_starts]
+
+        # Analyze metric
+        metric = metric_state.corr_positive
+        if detection.events:
+            peak_idx = detection.events[0].peak_index
+            timing_error = detection.events[0].detected_index - pilot_n_starts[0]
+        else:
+            peak_idx = int(np.argmax(metric_state.smooth_metric))
+            timing_error = peak_idx - pilot_n_starts[0]
+
+        peak_val = float(metric[peak_idx])
+
+        # Compute noise floor (excluding peak region and guard intervals)
+        peak_region = range(max(0, peak_idx - 500), min(len(metric), peak_idx + 500))
+        mask = np.ones(len(metric), dtype=bool)
+        mask[list(peak_region)] = False
+        # Also exclude guard intervals (low signal)
+        mask[:TX_PRE_PAD_SAMPLES] = False
+        noise_vals = metric[mask]
+        noise_floor = float(np.mean(noise_vals)) if len(noise_vals) > 0 else 0
+        noise_max = float(np.max(noise_vals)) if len(noise_vals) > 0 else 0
+
+        # Peak-to-average and peak-to-max ratios
+        par = peak_val / noise_floor if noise_floor > 0 else float('inf')
+        pmr = peak_val / noise_max if noise_max > 0 else float('inf')
+
+        results.append({
+            "seq_type": seq_type,
+            "peak_val": peak_val,
+            "peak_idx": peak_idx,
+            "timing_error": timing_error,
+            "noise_floor": noise_floor,
+            "noise_max": noise_max,
+            "par": par,  # Peak-to-average ratio
+            "pmr": pmr,  # Peak-to-max ratio
+            "metric": metric,
+        })
+
+    # Sort by peak-to-max ratio (best first)
+    results.sort(key=lambda x: -x["pmr"])
+
+    # Print results
+    print(f"\n{'='*80}")
+    print(f"SEQUENCE COMPARISON — {channel_desc.upper()}")
+    print(f"{'='*80}")
+    print(f"{'Sequence':<15} {'Peak':>10} {'Noise Avg':>12} {'Noise Max':>12} {'PAR':>8} {'PMR':>8} {'Timing Err':>12}")
+    print("-" * 80)
+    for r in results:
+        print(f"{r['seq_type']:<15} {r['peak_val']:>10.1f} {r['noise_floor']:>12.1f} {r['noise_max']:>12.1f} "
+              f"{r['par']:>8.1f} {r['pmr']:>8.1f} {r['timing_error']:>+12d}")
+    print("=" * 80)
+    print("PAR = Peak-to-Average Ratio, PMR = Peak-to-Max-sidelobe Ratio (higher is better)")
+    print("=" * 80 + "\n")
+
+    # Create comparison plot
+    plots_dir = PLOTS_BASE_DIR / "comparison" / ("measured_channel" if channel_name else "flat_awgn")
+    plots_dir.mkdir(parents=True, exist_ok=True)
+
+    fig, axes = plt.subplots(2, 1, figsize=(14, 10))
+
+    colors = plt.cm.tab10(np.linspace(0, 1, len(results)))
+    for i, r in enumerate(results):
+        axes[0].plot(r["metric"], label=f"{r['seq_type']} (PMR={r['pmr']:.1f})",
+                     color=colors[i], alpha=0.7)
+
+    axes[0].set_ylabel("Metric")
+    axes[0].set_title(f"Sequence Comparison — {channel_desc}")
+    axes[0].legend(loc="upper right", fontsize=8)
+    axes[0].grid(True, alpha=0.3)
+
+    # Zoomed view around first peak
+    peak_center = results[0]["peak_idx"]
+    zoom_start = max(0, peak_center - 600)
+    zoom_end = min(len(results[0]["metric"]), peak_center + 600)
+
+    for i, r in enumerate(results):
+        axes[1].plot(r["metric"][zoom_start:zoom_end],
+                     label=f"{r['seq_type']}", color=colors[i], alpha=0.8)
+
+    axes[1].set_xlabel(f"Sample index (offset from {zoom_start})")
+    axes[1].set_ylabel("Metric")
+    axes[1].set_title(f"Zoomed View Around Peak — {channel_desc}")
+    axes[1].legend(loc="upper right", fontsize=8)
+    axes[1].grid(True, alpha=0.3)
+
+    fig.tight_layout()
+    fig.savefig(plots_dir / "sequence_comparison.png", dpi=150)
+    plt.close(fig)
+
+    print(f"Plot saved: {plots_dir / 'sequence_comparison.png'}\n")
+
+    return results
+
+
+def run_comparison(channel_name: str | None, plots_subdir: str) -> None:
+    """Run both BPSK and ZC preambles and create comparison plots."""
+    rng_bpsk = np.random.default_rng(0)
+    rng_zc = np.random.default_rng(0)  # Same seed for same noise/channel
+
+    plots_dir = PLOTS_BASE_DIR / "comparison" / plots_subdir
+    plots_dir.mkdir(parents=True, exist_ok=True)
+
+    channel_desc = f"Measured CIR '{channel_name}'" if channel_name else "Flat AWGN"
+
+    # Load channel
+    if channel_name is None:
+        channel_impulse_response = None
+    else:
+        cir_bank = load_measured_cir(channel_name)
+        channel_impulse_response = cir_bank[:2].copy() if cir_bank.shape[0] > 2 else cir_bank.copy()
+
+    results = {}
+    for label, use_zc in [("BPSK", False), ("ZC", True)]:
+        rng = np.random.default_rng(0)  # Reset RNG for consistent noise
+
+        # Build frame
+        preamble = build_minn_preamble(rng, use_zc=use_zc, zc_root=ZC_ROOT)
+        pilot_symbol, _ = build_random_qpsk_symbol(rng, include_cp=True)
+        data_symbol, _ = build_random_qpsk_symbol(rng, include_cp=True)
+        frame = np.concatenate((preamble, pilot_symbol, data_symbol))
+        frame_len = frame.size
+        inter_guard = np.zeros(frame_len, dtype=complex)
+        leading_guard = np.zeros(TX_PRE_PAD_SAMPLES, dtype=complex)
+        tx_samples = np.concatenate((leading_guard, frame, inter_guard, frame))
+
+        # Apply channel
+        rx_samples = apply_channel(tx_samples, SNR_DB, rng, channel_impulse_response=channel_impulse_response)
+        rx_samples = apply_cfo(rx_samples, CFO_HZ, SAMPLE_RATE_HZ)
+
+        # Compute metric
+        metric_state = minn_rtl_streaming_metric(
+            rx_samples,
+            smooth_shift=SMOOTH_SHIFT,
+            threshold_value=THRESH_VALUE,
+            threshold_frac_bits=THRESH_FRAC_BITS,
+        )
+        detection = detect_minn_rtl(metric_state, hysteresis=HYSTERESIS, timing_offset=TIMING_OFFSET)
+
+        # Get timing info
+        Q = N_FFT // 4
+        preamble_len = 5 * Q
+        channel_peak_offset = compute_channel_peak_offset(channel_impulse_response)
+        frame_starts = [leading_guard.size, leading_guard.size + frame_len + inter_guard.size]
+        preamble_s0_starts = [start + channel_peak_offset for start in frame_starts]
+        pilot_cp_starts = [s0 + preamble_len for s0 in preamble_s0_starts]
+        pilot_n_starts = [cp + CYCLIC_PREFIX for cp in pilot_cp_starts]
+
+        if detection.events:
+            peak_idx = detection.events[0].peak_index
+            timing_error = detection.events[0].detected_index - pilot_n_starts[0]
+        else:
+            peak_idx = int(np.argmax(metric_state.smooth_metric))
+            timing_error = peak_idx - pilot_n_starts[0]
+
+        results[label] = {
+            "metric": metric_state,
+            "detection": detection,
+            "peak_idx": peak_idx,
+            "timing_error": timing_error,
+            "pilot_n_starts": pilot_n_starts,
+        }
+
+    # Create comparison plot
+    fig, axes = plt.subplots(2, 1, figsize=(14, 8), sharex=True)
+
+    colors = {"BPSK": "tab:blue", "ZC": "tab:orange"}
+    for label, data in results.items():
+        metric = data["metric"]
+        axes[0].plot(metric.corr_positive, label=f"{label} corr_plus", color=colors[label], alpha=0.7)
+        axes[0].plot(metric.smooth_metric, label=f"{label} smooth", color=colors[label], linestyle="--", alpha=0.9)
+
+    # Add expected and detected markers
+    for label, data in results.items():
+        peak_idx = data["peak_idx"]
+        timing_error = data["timing_error"]
+        axes[0].axvline(peak_idx, color=colors[label], linestyle=":", linewidth=2,
+                        label=f"{label} peak (err={timing_error:+d})")
+
+    # Expected position (same for both)
+    pilot_n_starts = results["BPSK"]["pilot_n_starts"]
+    for idx, expected in enumerate(pilot_n_starts):
+        lbl = "Expected (Pilot N start)" if idx == 0 else None
+        axes[0].axvline(expected, color="tab:green", linestyle="--", linewidth=2, label=lbl)
+
+    axes[0].set_ylabel("Metric")
+    axes[0].set_title(f"BPSK vs ZC Preamble Comparison — {channel_desc}")
+    axes[0].legend(loc="upper right", fontsize=9)
+    axes[0].grid(True, alpha=0.3)
+
+    # Zoomed view around first peak
+    peak_center = results["BPSK"]["peak_idx"]
+    zoom_start = max(0, peak_center - 800)
+    zoom_end = min(len(results["BPSK"]["metric"].corr_positive), peak_center + 800)
+
+    for label, data in results.items():
+        metric = data["metric"]
+        axes[1].plot(metric.corr_positive[zoom_start:zoom_end],
+                     label=f"{label}", color=colors[label], alpha=0.8)
+
+    # Mark peaks in zoomed view
+    for label, data in results.items():
+        rel_peak = data["peak_idx"] - zoom_start
+        if 0 <= rel_peak < (zoom_end - zoom_start):
+            axes[1].axvline(rel_peak, color=colors[label], linestyle=":", linewidth=2)
+
+    expected_rel = pilot_n_starts[0] - zoom_start
+    if 0 <= expected_rel < (zoom_end - zoom_start):
+        axes[1].axvline(expected_rel, color="tab:green", linestyle="--", linewidth=2, label="Expected")
+
+    axes[1].set_xlabel(f"Sample index (offset from {zoom_start})")
+    axes[1].set_ylabel("Metric")
+    axes[1].set_title(f"Zoomed View Around Peak — {channel_desc}")
+    axes[1].legend(loc="upper right")
+    axes[1].grid(True, alpha=0.3)
+
+    fig.tight_layout()
+    fig.savefig(plots_dir / "bpsk_vs_zc_metric.png", dpi=150)
+    plt.close(fig)
+
+    # Print summary
+    print(f"\n{'='*70}")
+    print(f"BPSK vs ZC COMPARISON — {channel_desc.upper()}")
+    print(f"{'='*70}")
+    for label, data in results.items():
+        print(f"  {label}: peak={data['peak_idx']}, timing_error={data['timing_error']:+d} samples")
+    print(f"  Plot saved: {plots_dir / 'bpsk_vs_zc_metric.png'}")
+    print(f"{'='*70}\n")
+
+
 def main() -> None:
     """Run simulations for both measured channel and flat AWGN conditions."""
     print("\n" + "=" * 70)
@@ -1001,12 +1450,20 @@ def main() -> None:
     run_simulation(channel_name="cir1", plots_subdir="measured_channel")
     run_simulation(channel_name=None, plots_subdir="flat_awgn")
 
+    # Run BPSK vs ZC comparison
+    print("\n" + "=" * 70)
+    print("RUNNING BPSK vs ZC COMPARISON")
+    print("=" * 70)
+    run_comparison(channel_name=None, plots_subdir="flat_awgn")
+    run_comparison(channel_name="cir1", plots_subdir="measured_channel")
+
     print("\n" + "=" * 70)
     print("ALL MINN RTL SIMULATIONS COMPLETE")
     print("=" * 70)
     print(f"\nCompare results in:")
     print(f"  - {(PLOTS_BASE_DIR / 'measured_channel').resolve()}")
     print(f"  - {(PLOTS_BASE_DIR / 'flat_awgn').resolve()}")
+    print(f"  - {(PLOTS_BASE_DIR / 'comparison').resolve()}")
     print("=" * 70 + "\n")
 
 
