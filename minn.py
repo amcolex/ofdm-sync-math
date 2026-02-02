@@ -653,5 +653,374 @@ def main():
     print("="*70 + "\n")
 
 
+def build_minn_preamble_parameterized(
+    rng: np.random.Generator,
+    symbol_len: int,
+    cp_len: int,
+    include_cp: bool = True,
+) -> np.ndarray:
+    """Build Minn preamble with configurable symbol length.
+    
+    Args:
+        rng: Random generator for BPSK sequence
+        symbol_len: N - the main symbol length (must be divisible by 4)
+        cp_len: Cyclic prefix length
+        include_cp: Whether to prepend CP
+        
+    Returns:
+        Preamble of length (cp_len + symbol_len) if include_cp else symbol_len
+    """
+    if symbol_len % 4 != 0:
+        raise ValueError(f"symbol_len must be divisible by 4, got {symbol_len}")
+    
+    Q = symbol_len // 4  # Quarter length
+    
+    # Generate a base sequence A of length Q
+    # Use a simpler approach: generate random BPSK sequence directly
+    A = rng.choice([-1.0, 1.0], size=Q) + 0j
+    
+    # Build [A, A, -A, -A] structure
+    symbol = np.concatenate([A, A, -A, -A])
+    
+    # Normalize to unit power
+    power = np.mean(np.abs(symbol) ** 2)
+    if power > 0:
+        symbol = symbol / np.sqrt(power)
+    
+    if include_cp:
+        # Add cyclic prefix (last cp_len samples)
+        cp = symbol[-cp_len:] if cp_len <= symbol_len else symbol
+        return np.concatenate([cp, symbol])
+    return symbol
+
+
+def minn_streaming_metric_parameterized(
+    rx: np.ndarray,
+    symbol_len: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Compute Minn timing metric with configurable symbol length.
+    
+    Args:
+        rx: Received samples (1D or 2D with branches on axis 0)
+        symbol_len: N - the preamble symbol length (determines Q = N/4)
+        
+    Returns:
+        M: Timing metric magnitude
+        P_sum: Complex correlation sum across branches
+        R_sum: Energy sum across branches
+    """
+    rx = np.asarray(rx)
+    if rx.ndim == 1:
+        rx = rx[np.newaxis, :]
+    
+    num_branches, L = rx.shape
+    Q = symbol_len // 4  # Quarter symbol length
+    N = symbol_len
+    out_len = max(L - N + 1, 0)
+    if out_len <= 0:
+        return np.zeros(0), np.zeros(0, dtype=complex), np.zeros(0)
+    
+    P_sum = np.zeros(out_len, dtype=np.complex128)
+    R_sum = np.zeros(out_len, dtype=np.float64)
+    
+    for b in range(num_branches):
+        x = rx[b]
+        Pb = np.empty(out_len, dtype=np.complex128)
+        Rb = np.empty(out_len, dtype=np.float64)
+        
+        for d in range(out_len):
+            q0 = x[d : d + Q]
+            q1 = x[d + Q : d + 2 * Q]
+            q2 = x[d + 2 * Q : d + 3 * Q]
+            q3 = x[d + 3 * Q : d + 4 * Q]
+            
+            C1 = np.sum(q0 * np.conj(q1))  # correlation between identical +A quarters
+            C2 = np.sum(q2 * np.conj(q3))  # correlation between identical -A quarters
+            P = C1 + C2
+            R = np.sum(np.abs(q1) ** 2 + np.abs(q2) ** 2 + np.abs(q3) ** 2)
+            
+            Pb[d] = P
+            Rb[d] = R
+        
+        P_sum += Pb
+        R_sum += Rb
+    
+    eps = 1e-12
+    aligned_real = np.clip(P_sum.real, 0.0, None)
+    M = (aligned_real ** 2) / (np.maximum(R_sum, eps) ** 2)
+    return M, P_sum, R_sum
+
+
+def compare_block_lengths(
+    block_lengths: list[int],
+    channel_name: str | None = None,
+    snr_db: float | None = None,
+) -> dict[int, dict]:
+    """Compare detection performance across different block lengths (symbol sizes).
+    
+    For classical Minn, the "block length" is the symbol length N (with Q = N/4).
+    Larger N means:
+    - Longer preamble = more overhead
+    - More samples in correlation = better noise averaging
+    - Longer plateau region
+    
+    Args:
+        block_lengths: List of N values to test (symbol lengths, must be divisible by 4)
+        channel_name: Channel CIR file name or None for flat AWGN
+        snr_db: SNR to use (defaults to module-level SNR_DB)
+        
+    Returns:
+        Dictionary mapping N -> {peak, par, pmr, timing_error, preamble_len, overhead_pct}
+    """
+    if snr_db is None:
+        snr_db = SNR_DB
+        
+    channel_impulse_response = None
+    if channel_name:
+        cir_bank = load_measured_cir(channel_name)
+        channel_impulse_response = cir_bank[:2].copy() if cir_bank.shape[0] > 2 else cir_bank.copy()
+    channel_peak_offset = compute_channel_peak_offset(channel_impulse_response)
+    
+    results: dict[int, dict] = {}
+    
+    for N in block_lengths:
+        rng = np.random.default_rng(0)
+        
+        # Use standard CP length (or scale it proportionally)
+        cp_len = N // 4  # Standard 25% CP ratio
+        
+        # Build preamble with this block length
+        preamble = build_minn_preamble_parameterized(rng, N, cp_len, include_cp=True)
+        preamble_len = cp_len + N
+        
+        # Build rest of frame (using standard N_FFT for pilot/data)
+        pilot_symbol, _ = build_random_qpsk_symbol(rng, include_cp=True)
+        data_symbol, _ = build_random_qpsk_symbol(rng, include_cp=True)
+        frame = np.concatenate((preamble, pilot_symbol, data_symbol))
+        frame_len = frame.size
+        
+        # Calculate overhead
+        payload_len = pilot_symbol.size + data_symbol.size
+        overhead_pct = 100.0 * preamble_len / frame_len
+        
+        # Build TX stream
+        inter_guard = np.zeros(frame_len, dtype=complex)
+        leading_guard = np.zeros(TX_PRE_PAD_SAMPLES, dtype=complex)
+        tx_samples = np.concatenate((leading_guard, frame, inter_guard, frame))
+        
+        # Apply channel
+        rng2 = np.random.default_rng(0)
+        rx_samples = apply_channel(tx_samples, snr_db, rng2, channel_impulse_response=channel_impulse_response)
+        rx_samples = apply_cfo(rx_samples, CFO_HZ, SAMPLE_RATE_HZ)
+        
+        # Compute metric with this block length
+        M, P_sum, R_sum = minn_streaming_metric_parameterized(rx_samples, N)
+        
+        if M.size == 0:
+            results[N] = {
+                "peak": 0,
+                "par": 0,
+                "pmr": 0,
+                "timing_error": 0,
+                "preamble_len": preamble_len,
+                "overhead_pct": overhead_pct,
+            }
+            continue
+        
+        # Expected peak position: preamble_start + N (metric peaks at end of preamble N-part)
+        frame_starts = [leading_guard.size, leading_guard.size + frame_len + inter_guard.size]
+        preamble_cp_starts = [start + channel_peak_offset for start in frame_starts]
+        expected_n_starts = [cp_start + cp_len for cp_start in preamble_cp_starts]
+        
+        # Find peak in FIRST FRAME region only
+        first_frame_end = frame_starts[0] + frame_len + inter_guard.size // 2
+        first_frame_metric = M[:min(first_frame_end, len(M))].copy()
+        peak_idx = int(np.argmax(first_frame_metric))
+        timing_error = peak_idx - expected_n_starts[0]
+        
+        peak_val = float(M[peak_idx])
+        
+        # Compute noise floor (excluding peak region)
+        peak_region = range(max(0, peak_idx - 500), min(len(M), peak_idx + 500))
+        mask = np.ones(len(M), dtype=bool)
+        mask[list(peak_region)] = False
+        mask[:TX_PRE_PAD_SAMPLES] = False
+        noise_vals = M[mask]
+        
+        if noise_vals.size > 0:
+            avg_noise = float(np.mean(noise_vals))
+            max_noise = float(np.max(noise_vals))
+            par = peak_val / avg_noise if avg_noise > 0 else float('inf')
+            pmr = peak_val / max_noise if max_noise > 0 else float('inf')
+        else:
+            par = float('inf')
+            pmr = float('inf')
+        
+        results[N] = {
+            "peak": peak_val,
+            "par": par,
+            "pmr": pmr,
+            "timing_error": timing_error,
+            "preamble_len": preamble_len,
+            "overhead_pct": overhead_pct,
+            "metric": M,
+            "P_sum": P_sum,
+            "R_sum": R_sum,
+        }
+    
+    return results
+
+
+def run_block_length_comparison(channel_name: str | None = None) -> None:
+    """Run and print block length comparison for classical Minn."""
+    # Test a range of block lengths (must be divisible by 4)
+    block_lengths = [256, 512, 1024, 2048]
+    
+    channel_desc = f"Measured CIR '{channel_name}'" if channel_name else "Flat AWGN"
+    print(f"\n{'='*80}")
+    print(f"BLOCK LENGTH COMPARISON (Classical Minn) - {channel_desc}")
+    print(f"{'='*80}")
+    print(f"Default N_FFT={N_FFT}, Default Q={N_FFT//4}")
+    print()
+    
+    results = compare_block_lengths(block_lengths, channel_name)
+    
+    # Print header
+    print(f"{'N':>6} | {'CP+N':>6} | {'Overhead':>8} | {'Peak':>10} | {'PAR':>8} | {'PMR':>8} | {'Timing':>8}")
+    print("-" * 80)
+    
+    for N in block_lengths:
+        r = results[N]
+        print(f"{N:>6} | {r['preamble_len']:>6} | {r['overhead_pct']:>7.1f}% | {r['peak']:>10.4f} | {r['par']:>8.1f} | {r['pmr']:>8.2f} | {r['timing_error']:>+8}")
+    
+    print()
+
+
+def plot_block_length_comparison(
+    block_lengths: list[int] | None = None,
+    snr_db: float | None = None,
+) -> None:
+    """Create comparison plots for different block lengths in both AWGN and multipath."""
+    if block_lengths is None:
+        block_lengths = [256, 512, 1024, 2048]
+    if snr_db is None:
+        snr_db = SNR_DB
+    
+    plots_dir = PLOTS_BASE_DIR / "block_length_comparison"
+    plots_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Colors for each block length
+    colors = {256: "tab:red", 512: "tab:orange", 1024: "tab:green", 2048: "tab:blue"}
+    
+    for channel_name, channel_label, subdir in [
+        (None, "Flat AWGN", "flat_awgn"),
+        ("cir1", "Multipath (cir1)", "measured_channel"),
+    ]:
+        channel_impulse_response = None
+        if channel_name:
+            cir_bank = load_measured_cir(channel_name)
+            channel_impulse_response = cir_bank[:2].copy() if cir_bank.shape[0] > 2 else cir_bank.copy()
+        channel_peak_offset = compute_channel_peak_offset(channel_impulse_response)
+        
+        fig, axes = plt.subplots(len(block_lengths), 1, figsize=(14, 3 * len(block_lengths)), sharex=True)
+        
+        for ax_idx, N in enumerate(block_lengths):
+            ax = axes[ax_idx]
+            rng = np.random.default_rng(0)
+            
+            cp_len = N // 4
+            
+            # Build preamble with this block length
+            preamble = build_minn_preamble_parameterized(rng, N, cp_len, include_cp=True)
+            preamble_len = cp_len + N
+            
+            # Build rest of frame
+            pilot_symbol, _ = build_random_qpsk_symbol(rng, include_cp=True)
+            data_symbol, _ = build_random_qpsk_symbol(rng, include_cp=True)
+            frame = np.concatenate((preamble, pilot_symbol, data_symbol))
+            frame_len = frame.size
+            
+            # Build TX stream
+            inter_guard = np.zeros(frame_len, dtype=complex)
+            leading_guard = np.zeros(TX_PRE_PAD_SAMPLES, dtype=complex)
+            tx_samples = np.concatenate((leading_guard, frame, inter_guard, frame))
+            
+            # Apply channel
+            rng2 = np.random.default_rng(0)
+            rx_samples = apply_channel(tx_samples, snr_db, rng2, channel_impulse_response=channel_impulse_response)
+            rx_samples = apply_cfo(rx_samples, CFO_HZ, SAMPLE_RATE_HZ)
+            
+            # Compute metric with this block length
+            M, P_sum, R_sum = minn_streaming_metric_parameterized(rx_samples, N)
+            
+            if M.size == 0:
+                ax.text(0.5, 0.5, "Metric empty", ha="center", va="center", transform=ax.transAxes)
+                continue
+            
+            # Expected peak position
+            frame_starts = [leading_guard.size, leading_guard.size + frame_len + inter_guard.size]
+            preamble_cp_starts = [start + channel_peak_offset for start in frame_starts]
+            expected_n_starts = [cp_start + cp_len for cp_start in preamble_cp_starts]
+            
+            # Find peak in FIRST FRAME region only
+            first_frame_end = frame_starts[0] + frame_len + inter_guard.size // 2
+            first_frame_metric = M[:min(first_frame_end, len(M))].copy()
+            peak_idx = int(np.argmax(first_frame_metric))
+            timing_error = peak_idx - expected_n_starts[0]
+            
+            # Compute energy-based threshold (like in original plots)
+            P_real_clipped = np.clip(P_sum.real, 0, None)
+            corr_raw = P_real_clipped ** 2
+            THRESH_FRAC = 0.10
+            energy_thresh = THRESH_FRAC * (R_sum ** 2)
+            
+            # Compute peak/threshold ratio at detected peak
+            peak_corr = corr_raw[peak_idx] if peak_idx < len(corr_raw) else 0
+            peak_thresh = energy_thresh[peak_idx] if peak_idx < len(energy_thresh) else 1
+            peak_ratio = peak_corr / peak_thresh if peak_thresh > 0 else 0
+            
+            # Normalize correlation and threshold for visualization (same scale)
+            max_corr = np.max(corr_raw) if np.max(corr_raw) > 0 else 1
+            corr_norm = corr_raw / max_corr
+            thresh_norm = energy_thresh / max_corr
+            
+            # Plot correlation and threshold
+            ax.plot(corr_norm, label=f"|P|² (corr)", color=colors.get(N, "tab:gray"), alpha=0.8)
+            ax.plot(thresh_norm, label=f"Threshold ({THRESH_FRAC:.0%}×R²)", color="gray", linestyle="--", alpha=0.6)
+            
+            # Mark expected and detected peaks
+            for exp in expected_n_starts:
+                ax.axvline(exp, color="green", linestyle="--", alpha=0.5, label="Expected" if exp == expected_n_starts[0] else None)
+            ax.axvline(peak_idx, color="red", linestyle=":", alpha=0.8, linewidth=2, label=f"Detected")
+            
+            ax.set_ylabel("Normalized")
+            ax.set_title(f"N={N} (Q={N//4}): preamble={preamble_len}, err={timing_error:+d}, peak/thresh={peak_ratio:.1f}×")
+            ax.legend(loc="upper right", fontsize=8)
+            ax.set_xlim(0, len(M))
+        
+        axes[-1].set_xlabel("Sample index")
+        fig.suptitle(f"Block Length Comparison - Classical Minn - {channel_label} (SNR={snr_db:.0f} dB)", fontsize=14, fontweight="bold")
+        plt.tight_layout()
+        
+        out_path = plots_dir / f"{subdir}_block_comparison_snr{int(snr_db):+d}dB.png"
+        plt.savefig(out_path, dpi=150)
+        plt.close()
+        print(f"Saved: {out_path}")
+
+
+def plot_snr_sweep(
+    block_lengths: list[int] | None = None,
+    snr_range: list[float] | None = None,
+) -> None:
+    """Create plots comparing block lengths across multiple SNR values."""
+    if block_lengths is None:
+        block_lengths = [256, 512, 1024, 2048]
+    if snr_range is None:
+        snr_range = [-5.0, 0.0, 5.0, 10.0]
+    
+    for snr_db in snr_range:
+        plot_block_length_comparison(block_lengths, snr_db)
+
+
 if __name__ == "__main__":
     main()
