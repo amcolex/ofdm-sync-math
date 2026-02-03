@@ -178,7 +178,7 @@ def run_simulation(channel_name: str | None, plots_subdir: str):
     sto_plot_path = plots_dir / "phase_slope_sto.png"
 
     # Build S&C preamble + block pilot (QPSK) + random QPSK data
-    sc_preamble = build_sc_preamble(rng, include_cp=False)
+    sc_preamble = build_sc_preamble(rng, include_cp=True)
     pilot_symbol, pilot_used = build_random_qpsk_symbol(rng, include_cp=True)
     data_symbol, data_used = build_random_qpsk_symbol(rng, include_cp=True)
     frame = np.concatenate((sc_preamble, pilot_symbol, data_symbol))
