@@ -75,7 +75,7 @@ def run_simulation(channel_name: str | None, plots_subdir: str):
     const_plot_path = plots_dir / "constellation.png"
     sto_plot_path = plots_dir / "phase_slope_sto.png"
 
-    pss_waveform = build_pss_symbol(include_cp=True)
+    pss_waveform = build_pss_symbol(include_cp=False)
     pilot_symbol, pilot_used = build_random_qpsk_symbol(rng, include_cp=True)
     data_symbol, data_used = build_random_qpsk_symbol(rng, include_cp=True)
     frame = np.concatenate((pss_waveform, pilot_symbol, data_symbol))
